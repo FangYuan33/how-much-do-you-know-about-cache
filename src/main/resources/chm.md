@@ -231,3 +231,5 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 
 
 key 和 value 不能为 null 的妙用
+
+只锁定头节点的弊端
