@@ -168,7 +168,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                 }
             }
         }
-        // todo
+        // 更新元素计数
         addCount(1L, binCount);
         return null;
     }
@@ -182,10 +182,10 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
     private final Node<K,V>[] initTable() {
         Node<K,V>[] tab; int sc;
         while ((tab = table) == null || tab.length == 0) {
-            if ((sc = sizeCtl) < 0)
-                Thread.yield();
             // 通过 CAS 操作将 sizeCtl 赋值为 -1，成功后 sizeCtl 为 -1 表示正在有线程在对它进行初始化
             // 如果此时再有其他线程来操作，CAS 操作会失败，会在 while 循环中自旋等待直到完成初始化
+            if ((sc = sizeCtl) < 0)
+                Thread.yield();
             else if (U.compareAndSetInt(this, SIZECTL, sc, -1)) {
                 try {
                     if ((tab = table) == null || tab.length == 0) {
@@ -229,7 +229,205 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 
 它是在 **if 条件** 判断中完成赋值的，这样写代码确实相对精简一些，但是也仅限于此（或非业务技术组件中），我觉得如果在业务代码中这样写，可读性就比较差了。
 
+`put` 方法向数组中每个桶添加第一个元素时，都会使用 CAS 操作。为了节省空间，并没有为每个桶都创建一个锁，而是将每个桶中第一个元素作为锁，当发生哈希碰撞时，依赖 `synchronized` 完成锁定。这里值得关注的是：在获取到该元素的锁后，又重复判断了链表头节点是否仍然为该元素（双重检测），因为该元素可能被其他线程操作删除。当某个桶中第一个元素被锁定时，其他线程的操作会被阻塞，如果 `equals` 方法耗时较长，可能会影响性能，但实际上，这种情况并不常见。
 
 key 和 value 不能为 null 的妙用
 
-只锁定头节点的弊端
+#### addCount 更新元素计数方法
+
+
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
+
+   private transient volatile CounterCell[] counterCells;
+
+   private static final long BASECOUNT;
+
+   private transient volatile long baseCount;
+
+   // counterCells 在创建元素或者在扩容的标志，使用 CAS 操作更新 
+   transient volatile int cellsBusy;
+
+   // CPU 核数
+   static final int NCPU = Runtime.getRuntime().availableProcessors();
+   
+    final V putVal(K key, V value, boolean onlyIfAbsent) {
+        // ...
+       
+        // 增加计数
+        addCount(1L, binCount);
+        return null;
+    }
+    
+    private final void addCount(long x, int check) {
+        CounterCell[] cs; long b, s;
+        // 更新元素计数，注意这里有 cas 操作更新 baseCount 的值，如果更新失败则会进入 if 条件的执行逻辑
+        if ((cs = counterCells) != null ||
+            !U.compareAndSetLong(this, BASECOUNT, b = baseCount, s = b + x)) {
+            CounterCell c; long v; int m;
+            boolean uncontended = true;
+            if (cs == null || (m = cs.length - 1) < 0 ||
+                (c = cs[ThreadLocalRandom.getProbe() & m]) == null ||
+                !(uncontended =
+                  U.compareAndSetLong(c, CELLVALUE, v = c.value, v + x))) {
+                // 负责 counterCells 的初始化和扩展
+                fullAddCount(x, uncontended);
+                return;
+            }
+            if (check <= 1)
+                return;
+            s = sumCount();
+        }
+        if (check >= 0) {
+            Node<K,V>[] tab, nt; int n, sc;
+            while (s >= (long)(sc = sizeCtl) && (tab = table) != null &&
+                   (n = tab.length) < MAXIMUM_CAPACITY) {
+                int rs = resizeStamp(n) << RESIZE_STAMP_SHIFT;
+                if (sc < 0) {
+                    if (sc == rs + MAX_RESIZERS || sc == rs + 1 ||
+                        (nt = nextTable) == null || transferIndex <= 0)
+                        break;
+                    if (U.compareAndSetInt(this, SIZECTL, sc, sc + 1))
+                        transfer(tab, nt);
+                }
+                else if (U.compareAndSetInt(this, SIZECTL, sc, rs + 2))
+                    transfer(tab, null);
+                s = sumCount();
+            }
+        }
+    }
+
+    // 与 longAdder 中实现原理一致
+   private final void fullAddCount(long x, boolean wasUncontended) {
+      int h;
+      // 如果线程探针值为 0 证明它还没被初始化，那么对它初始化
+      if ((h = ThreadLocalRandom.getProbe()) == 0) {
+         ThreadLocalRandom.localInit();
+         h = ThreadLocalRandom.getProbe();
+         wasUncontended = true;
+      }
+      // 冲突标志，用于标记创建计数元素时发生碰撞；槽位引用发生变化；槽位已满；槽位中计数元素发生变更
+      boolean collide = false;
+      // 自旋操作尝试更新，直到成功为止
+      for (;;) {
+         CounterCell[] cs; CounterCell c; int n; long v;
+         // 如果 counterCells 数组已经初始化，并且长度大于 0
+         if ((cs = counterCells) != null && (n = cs.length) > 0) {
+             // 如果槽位为空
+            if ((c = cs[(n - 1) & h]) == null) {
+               // 没有线程在创建计数元素
+               if (cellsBusy == 0) {   
+                   // 创建计数元素，并记录计数值 x
+                  CounterCell r = new CounterCell(x);
+                  // 将 cellsBusy 更新为 1，标志该线程正在创建计数元素
+                  if (cellsBusy == 0 && U.compareAndSetInt(this, CELLSBUSY, 0, 1)) {
+                     boolean created = false;
+                     try {               
+                        CounterCell[] rs; int m, j;
+                        // *双重校验* 该槽位未创建计数元素
+                        if ((rs = counterCells) != null && (m = rs.length) > 0 && rs[j = (m - 1) & h] == null) {
+                           rs[j] = r;
+                           created = true;
+                        }
+                     } finally {
+                         // 创建完成更新 cellsBusy 为 0，允许其他线程继续操作
+                        cellsBusy = 0;
+                     }
+                     // 创建完成，结束循环
+                     if (created)
+                        break;
+                     continue;
+                  }
+               }
+               // 变更冲突标志
+               collide = false;
+            }
+            // 标记 wasUncontended 为 true 后重试
+            else if (!wasUncontended)
+               wasUncontended = true;
+            // 成功更新计算元素值，退出循环
+            else if (U.compareAndSetLong(c, CELLVALUE, v = c.value, v + x))
+               break;
+            // 槽位引用已经发生变化或槽位已满
+            else if (counterCells != cs || n >= NCPU)
+                // 变更冲突标志
+               collide = false;
+            // 如果已经发生过冲突，标记为 true
+            else if (!collide)
+               collide = true;
+            // 如果 counterCells 需要扩容
+            else if (cellsBusy == 0 && U.compareAndSetInt(this, CELLSBUSY, 0, 1)) {
+               try {
+                   // 校验 counterCells 未发生变更
+                  if (counterCells == cs)
+                     counterCells = Arrays.copyOf(cs, n << 1);
+               } finally {
+                  cellsBusy = 0;
+               }
+               // 变更冲突标志位
+               collide = false;
+               // 扩容后重试
+               continue;
+            }
+            h = ThreadLocalRandom.advanceProbe(h);
+         }
+         // 如果 counterCells 未被初始化，则尝试初始化
+         else if (cellsBusy == 0 && counterCells == cs && U.compareAndSetInt(this, CELLSBUSY, 0, 1)) {
+            boolean init = false;
+            try {
+                // 双重校验 
+               if (counterCells == cs) {
+                   // 初始大小为 2
+                  CounterCell[] rs = new CounterCell[2];
+                  rs[h & 1] = new CounterCell(x);
+                  counterCells = rs;
+                  init = true;
+               }
+            } finally {
+               cellsBusy = 0;
+            }
+            // 完成初始化且创建好计数元素，结束循环
+            if (init)
+               break;
+         }
+         // 所有情况都不符合，直接在 baseCount 计数值上累加
+         else if (U.compareAndSetLong(this, BASECOUNT, v = baseCount, v + x))
+            break;
+      }
+   }
+
+   // 计算元素总数量的方法，baseCount 累加 counterCells 中计数元素计数值
+   final long sumCount() {
+      CounterCell[] cs = counterCells;
+      long sum = baseCount;
+      if (cs != null) {
+         for (CounterCell c : cs)
+            if (c != null)
+               sum += c.value;
+      }
+      return sum;
+   }
+
+}
+```
+
+
+`ConcurrentHashMap` 将大小固定为 2 的 n 次幂有几个重要的原因，主要是为了提高性能和简化实现。以下是详细的解释：
+
+1. **位运算优化**：
+    - 当哈希表的大小是 2 的 n 次幂时，可以使用位运算来代替取模运算（`%`），从而提高哈希表操作的性能。
+    - 例如，`index = hash % table.length` 可以简化为 `index = hash & (table.length - 1)`。位运算 `&` 通常比取模运算更快。
+
+2. **哈希分布均匀性**：
+    - 使用 2 的 n 次幂大小可以确保哈希值在表中的分布更均匀。
+    - 当表的大小是 2 的 n 次幂时，哈希值的低位比特可以直接用于计算索引，这样可以减少哈希冲突的概率。
+
+3. **简化扩容逻辑**：
+    - 在扩容时，如果新表的大小是旧表的两倍（即 2 的 n 次幂），元素的重新分配变得更加简便。
+    - 对于哈希表中的每个桶，扩容后元素的位置要么保持不变，要么移动到新位置 `index + oldCapacity`。这种移动逻辑可以通过简单的位运算实现。
+
+4. **减少空间浪费**：
+    - 选择 2 的 n 次幂大小可以使得哈希表的空间利用率更高，减少空间浪费。
+    - 由于哈希表的大小总是 2 的 n 次幂，因此每次扩容时只需要将表的大小翻倍，不会出现无法利用的空间碎片。
+
+综合以上几点，`ConcurrentHashMap` 将大小固定为 2 的 n 次幂，是为了优化性能、简化实现和提高空间利用率。这也是大多数哈希表实现中常见的一种设计选择。
