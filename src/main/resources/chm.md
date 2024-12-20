@@ -239,6 +239,20 @@ key 和 value 不能为 null 的妙用
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
 
+   private static final int RESIZE_STAMP_BITS = 16;
+
+   private static final int RESIZE_STAMP_SHIFT = 32 - RESIZE_STAMP_BITS;
+
+   private static final int MAXIMUM_CAPACITY = 1 << 30;
+
+   // 65535 允许最大操作扩容的线程数（好大...）
+   private static final int MAX_RESIZERS = (1 << (32 - RESIZE_STAMP_BITS)) - 1;
+   
+   transient volatile Node<K,V>[] table;
+
+   // 扩容操作后要使用的数组
+   private transient volatile Node<K,V>[] nextTable;
+    
    private transient volatile CounterCell[] counterCells;
 
    private static final long BASECOUNT;
@@ -261,37 +275,43 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
     
     private final void addCount(long x, int check) {
         CounterCell[] cs; long b, s;
-        // 更新元素计数，注意这里有 cas 操作更新 baseCount 的值，如果更新失败则会进入 if 条件的执行逻辑
-        if ((cs = counterCells) != null ||
-            !U.compareAndSetLong(this, BASECOUNT, b = baseCount, s = b + x)) {
+        // 更新元素计数，注意这里有 cas 操作更新 baseCount 的值，如果 CAS 更新失败或 counterCells 已经被初始化，会进入 if 条件的执行逻辑
+        if ((cs = counterCells) != null || !U.compareAndSetLong(this, BASECOUNT, b = baseCount, s = b + x)) {
             CounterCell c; long v; int m;
             boolean uncontended = true;
-            if (cs == null || (m = cs.length - 1) < 0 ||
-                (c = cs[ThreadLocalRandom.getProbe() & m]) == null ||
-                !(uncontended =
-                  U.compareAndSetLong(c, CELLVALUE, v = c.value, v + x))) {
+            if (cs == null || (m = cs.length - 1) < 0 || (c = cs[ThreadLocalRandom.getProbe() & m]) == null 
+                    || !(uncontended = U.compareAndSetLong(c, CELLVALUE, v = c.value, v + x))) {
                 // 负责 counterCells 的初始化和扩展
                 fullAddCount(x, uncontended);
                 return;
             }
             if (check <= 1)
                 return;
+            // 计算元素总和
             s = sumCount();
         }
         if (check >= 0) {
             Node<K,V>[] tab, nt; int n, sc;
-            while (s >= (long)(sc = sizeCtl) && (tab = table) != null &&
-                   (n = tab.length) < MAXIMUM_CAPACITY) {
+            // 增加元素后元素数量大于当前 sizeCtl 大小 且 table 已被初始化 且未超过最大容量
+            while (s >= (long)(sc = sizeCtl) && (tab = table) != null && (n = tab.length) < MAXIMUM_CAPACITY) {
+                // n 为 table 的长度（length），以 n 为参数计算 resizeStamp（扩容戳），唯一标识，用来协调多个线程同时操作 transfer
                 int rs = resizeStamp(n) << RESIZE_STAMP_SHIFT;
+                // sc < 0 表示正在进行扩容
                 if (sc < 0) {
-                    if (sc == rs + MAX_RESIZERS || sc == rs + 1 ||
-                        (nt = nextTable) == null || transferIndex <= 0)
+                    // 超过最大线程数量 或 最后一个扩容线程 或 扩容后数组为空 或 transferIndex小于等于0 则 退出循环
+                    if (sc == rs + MAX_RESIZERS || sc == rs + 1 || (nt = nextTable) == null || transferIndex <= 0)
                         break;
+                    // 将 sc 增加 1，表示增加一个扩容线程
                     if (U.compareAndSetInt(this, SIZECTL, sc, sc + 1))
+                        // 执行扩容操作，接下来具体讲解
                         transfer(tab, nt);
                 }
+                // sc >= 0 表示没有扩容操作在执行，CAS 操作将 sizeCtl 更新为 rs + 2，表示启动扩容操作
+                // todo 更新为 rs + 2 保证只能有一个线程来启动扩容
                 else if (U.compareAndSetInt(this, SIZECTL, sc, rs + 2))
+                    // todo ???执行扩容操作，第二个入参 Node<K,V>[] nextTab 为 null，只有一个线程能够启动扩容是为了 nextTab 只能被初始化一遍
                     transfer(tab, null);
+                // 计算元素总和
                 s = sumCount();
             }
         }
@@ -408,6 +428,11 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
       return sum;
    }
 
+   static final int resizeStamp(int n) {
+      // n 前导 0 数量位或运算
+      return Integer.numberOfLeadingZeros(n) | (1 << (RESIZE_STAMP_BITS - 1));
+   }
+   
 }
 ```
 

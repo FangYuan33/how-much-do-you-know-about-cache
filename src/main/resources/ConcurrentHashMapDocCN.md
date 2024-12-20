@@ -69,7 +69,7 @@ Insertion (via put or its variants) of the first node in an empty bin is perform
 
 Using the first node of a list as a lock does not by itself suffice though: When a node is locked, any update must first validate that it is still the first node after locking it, and retry if not. Because new nodes are always appended to lists, once a node is first in a bin, it remains first until deleted or the bin becomes invalidated (upon resizing).
 
-但是，使用列表的第一个节点作为锁本身并不足够：当一个节点被锁定时，任何更新都必须首先验证它锁定后仍然第一个节点，如果不是，则重试。因为新节点总是附加到列表中，所以一旦某个节点位于bin中的第一个节点，它将保持在第一个节点，直到删除或 bin 变为无效（在调整大小时）。
+但是，使用列表的第一个节点作为锁本身并不足够：当一个节点被锁定时，任何更新都必须首先验证它锁定后仍然是第一个节点，如果不是，则重试。因为新节点总是附加到列表中，所以一旦某个节点位于bin中的第一个节点，它将保持在第一个节点，直到删除或 bin 变为无效（在调整大小时）。
 
 The main disadvantage of per-bin locks is that other update operations on other nodes in a bin list protected by the same lock can stall, for example when user equals() or mapping functions take a long time. However, statistically, under random hash codes, this is not a common problem. Ideally, the frequency of nodes in bins follows a Poisson distribution (http://en.wikipedia.org/wiki/Poisson_distribution) with a parameter of about 0.5 on average, given the resizing threshold of 0.75, although with a large variance because of resizing granularity. Ignoring variance, the expected occurrences of list size k are (exp(-0.5) pow(0.5, k) / factorial(k)). The first values are:
 
