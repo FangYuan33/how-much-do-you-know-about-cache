@@ -108,10 +108,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                 tab = helpTransfer(tab, f);
             // onlyIfAbsent 是入参，默认为 false，表示键不存在时才插入新值，否则相同键值不能覆盖
             // 该逻辑满足在此特定条件下，避免获取锁，从而提高性能
-            else if (onlyIfAbsent
-                    && fh == hash
-                    && ((fk = f.key) == key || (fk != null && key.equals(fk)))
-                    && (fv = f.val) != null)
+            else if (onlyIfAbsent && fh == hash && ((fk = f.key) == key || (fk != null && key.equals(fk))) && (fv = f.val) != null)
                 return fv;
             else { // 执行到此处意味着该元素 hash 到的桶位置存在元素，需要追加到此处的链表或红黑树上，f 为该桶位置的第一个元素
                 V oldVal = null;
@@ -126,9 +123,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                             for (Node<K,V> e = f;; ++binCount) {
                                 K ek;
                                 // 如果发现了 key 值相同的元素，根据 onlyIfAbsent 字段判断是否需要覆盖
-                                if (e.hash == hash &&
-                                        ((ek = e.key) == key ||
-                                                (ek != null && key.equals(ek)))) {
+                                if (e.hash == hash && ((ek = e.key) == key || (ek != null && key.equals(ek)))) {
                                     oldVal = e.val;
                                     if (!onlyIfAbsent)
                                         e.val = value;
@@ -146,8 +141,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                             Node<K,V> p;
                             binCount = 2;
                             // 调用红黑树添加元素的方法
-                            if ((p = ((TreeBin<K,V>)f).putTreeVal(hash, key,
-                                    value)) != null) {
+                            if ((p = ((TreeBin<K,V>)f).putTreeVal(hash, key, value)) != null) {
                                 oldVal = p.val;
                                 if (!onlyIfAbsent)
                                     p.val = value;
@@ -656,6 +650,42 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
    }
 }
 ```
+
+在我们分析完上述源码后再来看 `helpTransfer` 方法就非常容易了，该方法用于其他线程帮助完成哈希表的扩容操作
+
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
+
+    // ...
+    
+    final Node<K, V>[] helpTransfer(Node<K, V>[] tab, Node<K, V> f) {
+        Node<K, V>[] nextTab;
+        int sc;
+        // 当前哈希表已经被初始化；当前节点为转发节点，表示扩容进行中；新哈希表也完成了初始化
+        if (tab != null && (f instanceof ForwardingNode) && (nextTab = ((ForwardingNode<K, V>) f).nextTable) != null) {
+            // 扩容戳，我们在讨论 addCount() 方法时提到过
+            int rs = resizeStamp(tab.length) << RESIZE_STAMP_SHIFT;
+            // 扩容进行中：旧哈希表仍然为旧哈希表；新哈希表仍为新哈希表；sizeCtl 仍然小于 0
+            while (nextTab == nextTable && table == tab &&
+                    (sc = sizeCtl) < 0) {
+                // 检查是否超过最大扩容线程数量
+                if (sc == rs + MAX_RESIZERS || sc == rs + 1 ||
+                        transferIndex <= 0)
+                    break;
+                // CAS 更新 sizeCtl + 1，表示扩容线程增加了一个 
+                if (U.compareAndSetInt(this, SIZECTL, sc, sc + 1)) {
+                    // 调用扩容方法
+                    transfer(tab, nextTab);
+                    break;
+                }
+            }
+            return nextTab;
+        }
+        return table;
+    }
+}
+```
+
 
 `ConcurrentHashMap` 将大小固定为 2 的 n 次幂有几个重要的原因，主要是为了提高性能和简化实现。以下是详细的解释：
 
