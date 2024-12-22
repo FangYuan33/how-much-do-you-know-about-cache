@@ -686,6 +686,84 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
+### treeifyBin
+
+`treeifyBin` 方法用于将链表转换给红黑树，以提高查询效率，具体逻辑如下：
+
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
+
+    // 链表树化的最小限制
+    static final int MIN_TREEIFY_CAPACITY = 64;
+
+    private final void treeifyBin(Node<K, V>[] tab, int index) {
+        Node<K, V> b;
+        int n;
+        if (tab != null) {
+            // 检查哈希表长度是否小于 64，如果小于的话执行的是扩容操作
+            if ((n = tab.length) < MIN_TREEIFY_CAPACITY)
+                tryPresize(n << 1);
+            // 检验该节点的哈希值大于等于 0，表示该节点是链表节点
+            else if ((b = tabAt(tab, index)) != null && b.hash >= 0) {
+                // 同步锁住该节点
+                synchronized (b) {
+                    // 锁住后校验该节点没有别其他线程修改
+                    if (tabAt(tab, index) == b) {
+                        // 将链表转换为红黑树
+                        TreeNode<K, V> hd = null, tl = null;
+                        for (Node<K, V> e = b; e != null; e = e.next) {
+                            TreeNode<K, V> p = new TreeNode<K, V>(e.hash, e.key, e.val, null, null);
+                            if ((p.prev = tl) == null)
+                                hd = p;
+                            else
+                                tl.next = p;
+                            tl = p;
+                        }
+                        // 将原表中原表节点替换为红黑树节点
+                        setTabAt(tab, index, new TreeBin<K, V>(hd));
+                    }
+                }
+            }
+        }
+    }
+
+    private final void tryPresize(int size) {
+        // 计算目标容量大小，如果超过最大容量的一半，直接赋值为最大容量，否则计算出合适容量（tableSizeFor 方法已在上文提到过）
+        int c = (size >= (MAXIMUM_CAPACITY >>> 1)) ? MAXIMUM_CAPACITY : tableSizeFor(size + (size >>> 1) + 1);
+        int sc;
+        while ((sc = sizeCtl) >= 0) {
+            Node<K, V>[] tab = table;
+            int n;
+            // 哈希表为空或者长度为 0，表示哈希表还未完成初始化
+            if (tab == null || (n = tab.length) == 0) {
+                // Math.max(sc, c);
+                n = (sc > c) ? sc : c;
+                // 更新 sizeCtl 为 -1，表示哈希表正在初始化
+                if (U.compareAndSetInt(this, SIZECTL, sc, -1)) {
+                    try {
+                        if (table == tab) {
+                            Node<K, V>[] nt = (Node<K, V>[]) new Node<?, ?>[n];
+                            table = nt;
+                            sc = n - (n >>> 2);
+                        }
+                    } finally {
+                        sizeCtl = sc;
+                    }
+                }
+            } else if (c <= sc || n >= MAXIMUM_CAPACITY)
+                break;
+            // 尝试扩容
+            else if (tab == table) {
+                // 计算扩容戳
+                int rs = resizeStamp(n);
+                // 这段逻辑就与 addCount 中第一个操作扩容的线程逻辑一致了
+                if (U.compareAndSetInt(this, SIZECTL, sc, (rs << RESIZE_STAMP_SHIFT) + 2))
+                    transfer(tab, null);
+            }
+        }
+    }
+}
+```
 
 `ConcurrentHashMap` 将大小固定为 2 的 n 次幂有几个重要的原因，主要是为了提高性能和简化实现。以下是详细的解释：
 
