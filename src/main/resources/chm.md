@@ -111,7 +111,8 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
             // 该逻辑满足在此特定条件下，避免获取锁，从而提高性能
             else if (onlyIfAbsent && fh == hash && ((fk = f.key) == key || (fk != null && key.equals(fk))) && (fv = f.val) != null)
                 return fv;
-            else { // 执行到此处意味着该元素 hash 到的桶位置存在元素，需要追加到此处的链表或红黑树上，f 为该桶位置的第一个元素
+            // 执行到此处意味着该元素 hash 到的桶位置存在元素，需要追加到此处的链表或红黑树上，f 为该桶位置的第一个元素
+            else {
                 V oldVal = null;
                 // 锁住第一个元素
                 synchronized (f) {
@@ -138,7 +139,8 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                                 }
                             }
                         }
-                        else if (f instanceof TreeBin) { // 如果该元素是红黑树
+                        // 如果该元素是红黑树
+                        else if (f instanceof TreeBin) { 
                             Node<K,V> p;
                             binCount = 2;
                             // 调用红黑树添加元素的方法
@@ -201,6 +203,8 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
     }
 }
 ```
+
+> `putTreeVal` 方法为向红黑树中添加元素的方法，如果想了解红黑树可以参考这篇文章[深入理解经典红黑树](https://juejin.cn/post/7313102241606238223)，在此处就不在解释相关逻辑了。
 
 在这段源码逻辑中，我能能发现一些具有“隐藏”性的赋值操作，比如在如下逻辑中，变量 `n` 的赋值：
 
