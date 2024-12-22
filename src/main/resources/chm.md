@@ -1,7 +1,11 @@
 
-![img.png](ConcurrentHashMap.png)
+`ConcurrentHashMap` 是线程安全的哈希表，在 Java 8 及之后的版本，使用 **CAS 操作**、 `synchronized` 关键字、合适的 **自旋重试** 和 `volatile`关键字（保证可见性和禁止指令重排）来保证并发安全，并对节点进行了优化：采用了链表和红黑树的实现，在链表节点数量大于等于 8 且数组（在后文中会称每个元素位置为桶）大小大于等于 64 时会转变为红黑树，在扩容逻辑中，当树节点小于等于 6 时又会转换成链表（删除逻辑中链表转换红黑树的逻辑并不严格按照大小为 6 的阈值），优化空间利用并提高查询效率。它的默认大小为 16，负载因子为 0.75F，负载因子不支持指定其他值，这是与 `HashMap` 的不同点，在讲解构造方法的源码时，会提到这一点，大家需要留意。另外，在源码中使用到了很多位运算，都是为了提高执行效率。
+
+本文将详细介绍 `ConcurrentHashMap` 构造方法、添加值方法和扩容操作等源码信息，关注实现
 
 ### 构造方法
+
+首先我们来看它的构造方法，重点关注注释信息：
 
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
@@ -27,19 +31,19 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
         this.sizeCtl = cap;
     }
 
-    // 向上取整 2的n次幂
+    // 向上取整 2 的n次幂
     private static final int tableSizeFor(int c) {
         // Integer.numberOfLeadingZeros(c - 1) 用于计算 c-1 的二进制表示中最高位 1 之前有多少个 0
         // -1 的二级制表示为 11111111111111111111111111111111（32个1），无符号右移则会得到某 2的n次幂-1 的结果
         int n = -1 >>> Integer.numberOfLeadingZeros(c - 1);
-        // 限制最大值的同时，结果永远为 2的n次幂
+        // 限制最大值的同时，结果永远为 2 的 n 次幂
         return (n < 0) ? 1 : (n >= MAXIMUM_CAPACITY) ? MAXIMUM_CAPACITY : n + 1;
     }
     
 }
 ```
 
-`loadFactor` 负载因子通常被指定为 **0.75F**，并且在源码中也提供了该默认值，如此的原因在源码的 JavaDoc 中有详细的介绍：
+负载因子 `loadFactor` 作为局部变量计算完 `size` 后，并没有被记录下来，后续有关该值的逻辑，如扩容阈值的计算均使用了默认值 **0.75F**。这么做的原因在源码 JavaDoc 中有详细的解释：
 
 > 理想情况下，容器中的节点遵循泊松分布，一个桶中有 k 个元素的概率分布如下：
 >
@@ -65,9 +69,19 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 >
 > 在随机散列下，两个线程访问不同元素的锁争用概率约为 1 / (8 * 元素数量)。
 
-该阈值能够较好的防止多个元素发生碰撞，在随机散列的情况下，多线程发生锁争抢的概率较低。负载因子 `loadFactor` 作为局部变量计算完 size 后，并没有被记录下来，后续有关该值的逻辑，如扩容阈值的计算均使用了默认值 0.75F。 
+在负载因子为 0.75F 时，能够较好的防止多个元素发生碰撞，在随机散列的情况下，多线程发生锁争抢的概率较低。
+
+`ConcurrentHashMap#tableSizeFor` 方法计算结果会将数组大小固定为 2 的 n 次幂，这样做是为了 **提高性能和简化实现**，以下为详细解释：
+
+1. **位运算优化**：当哈希表的大小是 2 的 n 次幂时，可以使用位运算来代替取模运算（`%`），从而提高哈希表操作的性能。比如计算某元素在数组中的位置，`index = hash % table.length` 可以简化为 `index = hash & (table.length - 1)`，位运算 `&` 通常比取模运算更快
+
+2. **哈希分布均匀性**：2 的 n 次幂减 1 的 2 进制表示中低位均为 1，哈希值与它进行位与计算可直接获取索引值，这样可以减少哈希冲突的概率，使分布更加均匀
+
+3. **简化扩容逻辑**：在扩容时，直接指定新表的大小是旧表的两倍（也是 2 的 n 次幂），元素的重新分配变得更加简便，要么元素的位置要么保持不变，要么移动到新位置 `index + oldCapacity`，这种移动逻辑可以通过简单的位运算实现
 
 ### put 方法
+
+`put` 方法是核心方法，需要重点关注添加值时使用到的 CAS + `synchronized` 的同步机制。更新元素计数的 `addCount` 方法采用了非常巧妙的实现，后文中我们会详细介绍。除此之外，扩容操作也会专门进行说明，它协调多线程共同完成扩容的解决方案也很值得学习，这些内容掌握之后，`ConcurrentHashMap` 中也再没有更难的内容。我们以 `put` 为切入点，重点关注注释信息：
 
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
@@ -226,14 +240,13 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
-它是在 **if 条件** 判断中完成赋值的，这样写代码确实相对精简一些，但是也仅限于此（或非业务技术组件中），我觉得如果在业务代码中这样写，可读性就比较差了。
+它是在 **if 条件** 判断中完成赋值的，这样写代码确实相对精简一些，但是也仅限于在此（或技术组件中），我觉得如果在业务代码中这样写，可读性就比较差了。
 
-`put` 方法向数组中每个桶添加第一个元素时，都会使用 CAS 操作。为了节省空间，并没有为每个桶都创建一个锁，而是将每个桶中第一个元素作为锁，当发生哈希碰撞时，依赖 `synchronized` 完成锁定。这里值得关注的是：在获取到该元素的锁后，又重复判断了链表头节点是否仍然为该元素（双重检测），因为该元素可能被其他线程操作删除。当某个桶中第一个元素被锁定时，其他线程的操作会被阻塞，如果 `equals` 方法耗时较长，可能会影响性能，但实际上，这种情况并不常见。
+`put` 方法向数组中每个桶添加第一个元素时，都会使用 CAS 操作。为了节省空间，并没有为每个桶都创建一个锁，而是将每个桶中第一个元素作为锁，当发生哈希碰撞时，依赖 `synchronized` 完成锁定。这里值得关注的是：在获取到该元素的锁后，又重复判断了链表头节点是否仍然为该元素（双重检测），因为该元素可能被其他线程操作删除，在接下来的源码中还能看到很多在执行完同步操作后重新再判断是否符合条件的逻辑，这也是在提醒我们：写线程同步相关代码时有时需要再校验。当某个桶中第一个元素被锁定时，其他操作该桶元素的线程操作会被阻塞，如果 `equals` 方法耗时较长，可能会影响性能，但实际上，这种情况并不常见。
 
-key 和 value 不能为 null 的妙用
+### addCount 更新元素计数方法
 
-#### addCount 更新元素计数方法
-
+接下来我们看一下 `addCount` 更新元素数量的方法，该方法实现的元素计数非常有意思：在更新元素数量时未发生冲突则始终使用 `baseCount` 来表示哈希表中元素适量，一旦 CAS 更新数量失败，它便会创建一个 `CounterCell[] counterCells` 来协助统计元素数量，总数量为 `baseCount` 和 `CounterCell[] counterCells` 中计数值的累加。并且判断哈希表是否需要扩容也是在这里完成的。本节方法非常重要，需要大家重点关注：
 
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
@@ -278,9 +291,9 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
         if ((cs = counterCells) != null || !U.compareAndSetLong(this, BASECOUNT, b = baseCount, s = b + x)) {
             CounterCell c; long v; int m;
             boolean uncontended = true;
+           // 负责 counterCells 的初始化和扩展
             if (cs == null || (m = cs.length - 1) < 0 || (c = cs[ThreadLocalRandom.getProbe() & m]) == null 
                     || !(uncontended = U.compareAndSetLong(c, CELLVALUE, v = c.value, v + x))) {
-                // 负责 counterCells 的初始化和扩展
                 fullAddCount(x, uncontended);
                 return;
             }
@@ -335,7 +348,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
              // 如果槽位为空
             if ((c = cs[(n - 1) & h]) == null) {
                // 没有线程在创建计数元素
-               if (cellsBusy == 0) {   
+               if (cellsBusy == 0) {
                    // 创建计数元素，并记录计数值 x
                   CounterCell r = new CounterCell(x);
                   // 将 cellsBusy 更新为 1，标志该线程正在创建计数元素
@@ -343,8 +356,9 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                      boolean created = false;
                      try {               
                         CounterCell[] rs; int m, j;
-                        // *双重校验* 该槽位未创建计数元素
+                        // 双重校验该槽位未创建计数元素
                         if ((rs = counterCells) != null && (m = rs.length) > 0 && rs[j = (m - 1) & h] == null) {
+                           // 为槽位赋值
                            rs[j] = r;
                            created = true;
                         }
@@ -435,7 +449,11 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
-#### transfer
+在元素计数 `fullAddCount` 方法中，会为新增的元素数量 x 在 `CounterCell[]` 中找到一个槽位记录或累加，在进行该操作时使用了自旋重试保证执行成功。元素计数累加完成后，会对是否需要扩容进行判断，如果元素数量超过 `sizeCtl` 则会进行扩容操作，在扩容开始时，会将 `sizeCtl` 赋值为负数，这样在执行扩容方法时，只有一个线程能调用 `transfer(tab, null);` 方法，保证扩容后哈希表 `nextTable` 仅被初始化一次，完成多线程扩容的协调。这里弄明白之后，接下来重点看扩容方法 `transfer`。
+
+#### transfer 扩容方法
+
+扩容方法 `transfer` 允许多线程协同扩容，实现协同扩容的方法很巧妙，它定义了全局变量 `transferIndex` 用于记录当前扩容操作的进度（为 0 时表示快完成或已经完成，初始值为哈希表长度），规定每个线程的处理步长 `stride` 最小值为 16，如果 `transferIndex` 大于步长值 `stride` 时，其他线程调用该方法时会被分配扩容任务协助完成扩容，这样每个线程便被分配了一段处理范围，线程与线程间扩容互不影响，提高了扩容效率。以下为源码，其中已经注明了详细注释，大家需要根据源码和注释信息理解该过程：
 
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
@@ -489,7 +507,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
         int nextn = nextTab.length;
         // 转发节点，用于标记该节点已经被添加到新表中，它会被插入到桶中第一个元素的位置
         ForwardingNode<K, V> fwd = new ForwardingNode<K, V>(nextTab);
-        // 前进标志，用于判断是否处理下一个桶
+        // 前进标志，用于控制是否需要检查 去处理下一个桶 或 是否需要被分配下一组数据的执行任务
         boolean advance = true;
         // 即将完成标志，如果该值为 true 再重新检查一遍哈希表元素即完成扩容操作
         boolean finishing = false; 
@@ -500,25 +518,32 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
             int fh;
             while (advance) {
                 int nextIndex, nextBound;
-                // 如果 i 仍然在范围内 或 处于正在完成阶段，则不再继续处理
+                // 在这里更新当前线程的处理索引 --i，如果 i 仍然在范围内 或 处于正在完成阶段
                 if (--i >= bound || finishing)
+                    // 结束循环去执行下面的节点转移操作
                     advance = false;
-                // transferIndex 小于等于 0 说明所有桶已经被分配完毕了，不再继续处理
+                // transferIndex 小于等于 0 说明所有桶的处理任务已经被分配完毕了，新线程无需再协助扩容了
                 else if ((nextIndex = transferIndex) <= 0) {
                     i = -1;
+                    // 结束循环去执行下面的节点转移操作
                     advance = false;
                 }
-                // CAS 操作更新 transferIndex，分配新的范围 nextBound 并更新 i 和 bound
+                // 线程第一次循环都会来执行这段逻辑来分配要处理的数据范围
+                // CAS 操作更新 transferIndex 为 transferIndex - stride，该值为下一个线程的处理范围的右边界 nextBound
                 else if (U.compareAndSetInt(this, TRANSFERINDEX, nextIndex, nextBound = (nextIndex > stride ? nextIndex - stride : 0))) {
+                    // 当前线程处理范围的左边界 bound
                     bound = nextBound;
+                    // 此时 nextIndex 为 CAS 更新前 transferIndex 大小，减一即表示有效索引
+                    // 所以线程处理数据的有效范围是 [bound, i] 的闭区间，从 i 倒序处理
                     i = nextIndex - 1;
+                    // 结束循环去执行下面的节点转移逻辑
                     advance = false;
                 }
             }
             // 如果 i 超出有效范围，检测是否需要结束扩容
             if (i < 0 || i >= n || i + n >= nextn) {
                 int sc;
-                // 在完成阶段
+                // 扩容已完成
                 if (finishing) {
                     nextTable = null;
                     table = nextTab;
@@ -526,10 +551,10 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                     sizeCtl = (n << 1) - (n >>> 1);
                     return;
                 }
-                // CAS 操作更新 sizeCtl 为 sizeCtl - 1 表示执行扩容的线程已经操作完成了
+                // CAS 操作更新 sizeCtl 为 sizeCtl - 1 表示执行扩容的其中之一线程已经操作完成了
                 if (U.compareAndSetInt(this, SIZECTL, sc = sizeCtl, sc - 1)) {
                     // 这里就要和 addCount 方法中执行扩容更新 sizeCtl 的方法联系起来
-                    // sizeCtl 在执行时扩容时被赋值为 resizeStamp(n) << RESIZE_STAMP_SHIFT + 2
+                    // sizeCtl 在执行扩容时先被赋值为 resizeStamp(n) << RESIZE_STAMP_SHIFT + 2
                     // 每有一个线程帮助扩容则 +1；每有一个线程扩容完成便 -1
                     // 当再将 sizeCtl 减到 resizeStamp(n) << RESIZE_STAMP_SHIFT + 2 时，说明帮助扩容的线程都已经操作完成了
                     // 此时可以将 finishing 更新为 true 并重新循环检查所有桶
@@ -541,9 +566,11 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
             }
             // 如果当前桶为 null，那么直接将其更改为转发节点（ForwardingNode），标志该桶已被处理
             else if ((f = tabAt(tab, i)) == null)
+                // 处理成功则会再去执行 while 循环中的方法，判断是处理下一个桶还是分配下一批数据的处理任务
                 advance = casTabAt(tab, i, null, fwd);
             // 判断是否为转发节点（已经处理过）
             else if ((fh = f.hash) == MOVED)
+                // 处理成功则会再去执行 while 循环中的方法，判断是处理下一个桶还是分配下一批数据的处理任务
                 advance = true;
             // 否则处理该节点
             else {
@@ -591,7 +618,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                             setTabAt(nextTab, i + n, hn);
                             // 将旧表的 i 索引处元素更新为转发节点，表示已处理
                             setTabAt(tab, i, fwd);
-                            // 更新为 true，以便继续处理下一个桶
+                            // 更新为 true，以便在上文的 while 循环中判断是否要被分配下一批任务或处理下一个桶
                             advance = true;
                         }
                         // 如果该节点为红黑树节点
@@ -633,7 +660,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                             setTabAt(nextTab, i + n, hn);
                             // 更新该节点为转发节点
                             setTabAt(tab, i, fwd);
-                            // 更新为 true，以便继续处理下一个桶
+                            // 更新为 true，以便在上文的 while 循环中判断是否要被分配下一批任务或处理下一个桶
                             advance = true;
                         }
                     }
@@ -656,7 +683,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
-在我们分析完上述源码后再来看 `helpTransfer` 方法就非常容易了，该方法用于其他线程帮助完成哈希表的扩容操作
+在我们分析完上述源码后再来看 `helpTransfer` 方法就非常容易了，该方法用于其他线程协助完成哈希表的扩容操作，本质上还是会调用 `transfer` 方法：
 
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
@@ -691,9 +718,11 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
-### treeifyBin
+到目前为止，相对复杂的逻辑已经全部讲解完了，接下来的内容在理解了上述内容后再看会非常简单，所以如果没理解上方的源码内容需要再去熟悉熟悉。
 
-`treeifyBin` 方法用于将链表转换给红黑树，以提高查询效率，具体逻辑如下：
+### treeifyBin 树化方法
+
+`treeifyBin` 方法用于将链表转换成红黑树，以提高查询效率，逻辑非常简单，关注注释信息即可，如下：
 
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
@@ -770,7 +799,9 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
-### get
+### get 方法
+
+`get` 方法非常简单，如下：
 
 ```java
 public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
@@ -794,8 +825,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
                 return (p = e.find(h, key)) != null ? p.val : null;
             // 遍历链表尝试找到要匹配的节点
             while ((e = e.next) != null) {
-                if (e.hash == h &&
-                        ((ek = e.key) == key || (ek != null && key.equals(ek))))
+                if (e.hash == h && ((ek = e.key) == key || (ek != null && key.equals(ek))))
                     return e.val;
             }
         }
@@ -804,7 +834,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
-在 `eh < 0` 的条件下，表示两种情况：要么为红黑树节点，要么正在扩容（`ForwardingNode`），前者就不在这里赘述了，我们需要看一下在扩容时，哈希表是如何寻找对应节点的，如下为 `ForwardingNode` 源码：
+在 `eh < 0` 的条件下，表示两种情况：要么为红黑树节点，要么正在扩容（`ForwardingNode`），前者就不在这里赘述了。这里我们需要看一下在扩容时，哈希表是如何寻找对应节点的，如下为 `ForwardingNode` 中查找对应节点值的源码：
 
 ```java
 static final class ForwardingNode<K,V> extends Node<K,V> {
@@ -845,7 +875,7 @@ static final class ForwardingNode<K,V> extends Node<K,V> {
 
    static class Node<K,V> implements Map.Entry<K,V> {
       
-      // 不过是简单地遍历查找
+      // 简单地遍历查找
       Node<K,V> find(int h, Object k) {
          Node<K,V> e = this;
          if (k != null) {
@@ -862,25 +892,107 @@ static final class ForwardingNode<K,V> extends Node<K,V> {
 }
 ```
 
-由以上源码可知，在寻找某节点时，发现了转发节点，那么证明该节点已经被转移到新的哈希表中且这个时候扩容操作还没有完成，那么需要去新的哈希表中寻找。
+由以上源码可知，在寻找某节点时如果发现了 **转发节点**，那么证明该节点已经被转移到新的哈希表中，那么需要去新的哈希表中寻找。
 
+### remove 方法
 
-`ConcurrentHashMap` 将大小固定为 2 的 n 次幂有几个重要的原因，主要是为了提高性能和简化实现。以下是详细的解释：
+`remove` 方法也非常简单，当某节点被删除时需要更新计数，`addCount` 我们在上文也介绍过，就不在赘述了。在红黑树中移除节点（`removeTreeNode` 方法）时，可能会调用到 `untreeify` 方法，这里的将红黑树转换成链表的逻辑与在 `transfer` 中根据节点数量小于等于阈值 6 的转换判断逻辑不同，`removeTreeNode` 决定将链表转换成红黑树时判断的依据是红黑树是否太小（too small）：`root == null || r.right == null || (rl = r.left) == null || rl.left == null`，感兴趣的大家可以去源码中了解一下，在这里就不再贴源码了。以下为删除方法主要逻辑，重点关注注释信息：
 
-1. **位运算优化**：
-    - 当哈希表的大小是 2 的 n 次幂时，可以使用位运算来代替取模运算（`%`），从而提高哈希表操作的性能。
-    - 例如，`index = hash % table.length` 可以简化为 `index = hash & (table.length - 1)`。位运算 `&` 通常比取模运算更快。
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
+    
+    public V remove(Object key) {
+        return replaceNode(key, null, null);
+    }
+    
+    final V replaceNode(Object key, V value, Object cv) {
+        // 计算 key 对应的 hash 值
+        int hash = spread(key.hashCode());
+        for (Node<K,V>[] tab = table;;) {
+            Node<K,V> f; int n, i, fh;
+            // 如果未完成初始化或要删除的节点不存在
+            if (tab == null || (n = tab.length) == 0 || (f = tabAt(tab, i = (n - 1) & hash)) == null)
+                break;
+            // 节点为转移节点，协助扩容
+            else if ((fh = f.hash) == MOVED)
+                tab = helpTransfer(tab, f);
+            // 处理对应节点
+            else {
+                V oldVal = null;
+                // 某节点被修改或删除，标记为 true
+                boolean validated = false;
+                // 先加锁
+                synchronized (f) {
+                    // 加锁完成后重复校验该节点是否被修改过
+                    if (tabAt(tab, i) == f) {
+                        // 处理链表节点
+                        if (fh >= 0) {
+                            validated = true;
+                            for (Node<K,V> e = f, pred = null;;) {
+                                K ek;
+                                // 如果匹配到了对应的节点
+                                if (e.hash == hash && ((ek = e.key) == key || (ek != null && key.equals(ek)))) {
+                                    V ev = e.val;
+                                    if (cv == null || cv == ev || (ev != null && cv.equals(ev))) {
+                                        // 记录原节点值
+                                        oldVal = ev;
+                                        // value 不为 null 才更新为新节点值
+                                        if (value != null)
+                                            e.val = value;
+                                        // 删除中间节点或尾节点
+                                        else if (pred != null)
+                                            pred.next = e.next;
+                                        else
+                                        // 删除头节点
+                                            setTabAt(tab, i, e.next);
+                                    }
+                                    break;
+                                }
+                                // 向后遍历，变更引用
+                                pred = e;
+                                if ((e = e.next) == null)
+                                    break;
+                            }
+                        }
+                        // 处理红黑树节点
+                        else if (f instanceof TreeBin) {
+                            validated = true;
+                            TreeBin<K,V> t = (TreeBin<K,V>)f;
+                            TreeNode<K,V> r, p;
+                            if ((r = t.root) != null && (p = r.findTreeNode(hash, key, null)) != null) {
+                                V pv = p.val;
+                                if (cv == null || cv == pv || (pv != null && cv.equals(pv))) {
+                                    oldVal = pv;
+                                    if (value != null)
+                                        p.val = value;
+                                    else if (t.removeTreeNode(p))
+                                        setTabAt(tab, i, untreeify(t.first));
+                                }
+                            }
+                        }
+                        else if (f instanceof ReservationNode)
+                            throw new IllegalStateException("Recursive update");
+                    }
+                }
+                if (validated) {
+                    // 原值不为空则返回该值
+                    if (oldVal != null) {
+                        // 节点被删除则更新计数
+                        if (value == null)
+                            addCount(-1L, -1);
+                        return oldVal;
+                    }
+                    break;
+                }
+            }
+        }
+        return null;
+    }
+}
+```
 
-2. **哈希分布均匀性**：
-    - 使用 2 的 n 次幂大小可以确保哈希值在表中的分布更均匀。
-    - 当表的大小是 2 的 n 次幂时，哈希值的低位比特可以直接用于计算索引，这样可以减少哈希冲突的概率。
+到这里 `ConcurrentHashMap` 中的源码大部分已经介绍完了，接下来我们简单谈一些有意思的问题。
 
-3. **简化扩容逻辑**：
-    - 在扩容时，如果新表的大小是旧表的两倍（即 2 的 n 次幂），元素的重新分配变得更加简便。
-    - 对于哈希表中的每个桶，扩容后元素的位置要么保持不变，要么移动到新位置 `index + oldCapacity`。这种移动逻辑可以通过简单的位运算实现。
+### key 和 value 不能为 null 的妙用
 
-4. **减少空间浪费**：
-    - 选择 2 的 n 次幂大小可以使得哈希表的空间利用率更高，减少空间浪费。
-    - 由于哈希表的大小总是 2 的 n 次幂，因此每次扩容时只需要将表的大小翻倍，不会出现无法利用的空间碎片。
-
-综合以上几点，`ConcurrentHashMap` 将大小固定为 2 的 n 次幂，是为了优化性能、简化实现和提高空间利用率。这也是大多数哈希表实现中常见的一种设计选择。
+`ConcurrentHashMap` 与 `HashMap` 不同，它是不允许 key 和 value 为 null 的，这是为什么呢？根据源码分析，我觉得主要原因是为了 **简化并发逻辑**，提高处理效率，这样当遇到某桶中元素为 null 时便能判定此处无元素并不需要为 null 做特殊处理。当然这样做也能 **避免歧义**，比如我们在使用 `get` 方法获取某 key 的值时，为 null 就表示该键值对不存在，而不会发生认为这个 key 存在但 value 为 null 的情况。
