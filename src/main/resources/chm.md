@@ -1,4 +1,5 @@
 
+![img.png](ConcurrentHashMap.png)
 
 ### 构造方法
 
@@ -764,6 +765,101 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
     }
 }
 ```
+
+### get
+
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
+
+    public V get(Object key) {
+        Node<K, V>[] tab;
+        Node<K, V> e, p;
+        int n, eh;
+        K ek;
+        // 计算出经过扰动的 hash 值
+        int h = spread(key.hashCode());
+        // 哈希表已经完成初始化且该索引处元素不为 null
+        if ((tab = table) != null && (n = tab.length) > 0 && (e = tabAt(tab, (n - 1) & h)) != null) {
+            // 哈希值相等，判断第一个节点是不是想要的节点
+            if ((eh = e.hash) == h) {
+                // key 相等则返回对应的值
+                if ((ek = e.key) == key || (ek != null && key.equals(ek)))
+                    return e.val;
+            // 当节点哈希值小于 0 时，表示两种情况：要么为红黑树节点，要么正在扩容
+            } else if (eh < 0)
+                return (p = e.find(h, key)) != null ? p.val : null;
+            // 遍历链表尝试找到要匹配的节点
+            while ((e = e.next) != null) {
+                if (e.hash == h &&
+                        ((ek = e.key) == key || (ek != null && key.equals(ek))))
+                    return e.val;
+            }
+        }
+        return null;
+    }
+}
+```
+
+在 `eh < 0` 的条件下，表示两种情况：要么为红黑树节点，要么正在扩容（`ForwardingNode`），前者就不在这里赘述了，我们需要看一下在扩容时，哈希表是如何寻找对应节点的，如下为 `ForwardingNode` 源码：
+
+```java
+static final class ForwardingNode<K,V> extends Node<K,V> {
+   final Node<K,V>[] nextTable;
+   ForwardingNode(Node<K,V>[] tab) {
+      super(MOVED, null, null);
+      this.nextTable = tab;
+   }
+
+   Node<K,V> find(int h, Object k) {
+      // 注意这里的 outer 标志，如果在寻找节点中发现 e 为转发节点，那么需要再去新的被扩容后的表中寻找对应节点
+      outer: for (Node<K,V>[] tab = nextTable;;) {
+         Node<K,V> e; int n;
+         // 要找的对象为 null 或者 tab 未初始化 或者 桶对应的位置为 null
+         if (k == null || tab == null || (n = tab.length) == 0 || (e = tabAt(tab, (n - 1) & h)) == null)
+            return null;
+         for (;;) {
+            int eh; K ek;
+            // 找到了对应的节点
+            if ((eh = e.hash) == h && ((ek = e.key) == k || (ek != null && k.equals(ek))))
+               return e;
+            if (eh < 0) {
+               // 发现了转发节点，说明该节点已经再次被转移到了新的哈希表中，需要去新的哈希表寻找
+               if (e instanceof ForwardingNode) {
+                  tab = ((ForwardingNode<K,V>)e).nextTable;
+                  continue outer;
+               }
+               else
+                  // 调用 node 的 find 方法
+                  return e.find(h, k);
+            }
+            // 找完了所有节点仍然没找到
+            if ((e = e.next) == null)
+               return null;
+         }
+      }
+   }
+
+   static class Node<K,V> implements Map.Entry<K,V> {
+      
+      // 不过是简单地遍历查找
+      Node<K,V> find(int h, Object k) {
+         Node<K,V> e = this;
+         if (k != null) {
+            do {
+               K ek;
+               if (e.hash == h &&
+                       ((ek = e.key) == k || (ek != null && k.equals(ek))))
+                  return e;
+            } while ((e = e.next) != null);
+         }
+         return null;
+      }
+   }
+}
+```
+
+由以上源码可知，在寻找某节点时，发现了转发节点，那么证明该节点已经被转移到新的哈希表中且这个时候扩容操作还没有完成，那么需要去新的哈希表中寻找。
+
 
 `ConcurrentHashMap` 将大小固定为 2 的 n 次幂有几个重要的原因，主要是为了提高性能和简化实现。以下是详细的解释：
 
