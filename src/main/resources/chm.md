@@ -1104,3 +1104,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 ### key 和 value 不能为 null 的妙用
 
 `ConcurrentHashMap` 与 `HashMap` 不同，它是不允许 key 和 value 为 null 的，这是为什么呢？根据源码分析，我觉得主要原因是为了 **简化并发逻辑**，提高处理效率，这样当遇到某桶中元素为 null 时便能判定此处无元素并不需要为 null 做特殊处理。当然这样做也能 **避免歧义**，比如我们在使用 `get` 方法获取某 key 的值时，为 null 就表示该键值对不存在，而不会发生认为这个 key 存在但 value 为 null 的情况。
+
+### ConcurrentHashMap 对代码的编排
+
+`ConcurrentHashMap` 为了增加可读性，它首先排列了主要的静态常量声明和内部常用的静态方法，再声明了字段，然后才是主要的公有方法，最后是通用的扩容方法、树的定义、迭代器和批量操作方法。之后我们在写代码时也可以参考它对字段方法的排列。
