@@ -991,6 +991,114 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements Concurre
 }
 ```
 
+### computeIfAbsent 方法
+
+先前我们提到过 `ReservationNode` 用于占位，那么我们就以 `computeIfAbsent` 方法为例，来简单看一下它是怎么来占位的，其中大部分逻辑我们在上文中已经介绍过，主要关注它的不同点：
+
+```java
+public class ConcurrentHashMap<K,V> extends AbstractMap<K,V> implements ConcurrentMap<K,V>, Serializable {
+
+    // 该方法用于某个键未被添加到哈希表中时，使用给定的函数计算值并将其添加到哈希表中
+    public V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction) {
+        if (key == null || mappingFunction == null)
+            throw new NullPointerException();
+        int h = spread(key.hashCode());
+        V val = null;
+        int binCount = 0;
+        for (Node<K, V>[] tab = table; ; ) {
+            Node<K, V> f;
+            int n, i, fh;
+            K fk;
+            V fv;
+            // 初始化操作
+            if (tab == null || (n = tab.length) == 0)
+                tab = initTable();
+            // 未在桶中匹配到元素
+            else if ((f = tabAt(tab, i = (n - 1) & h)) == null) {
+                // 创建占位符节点，并加锁
+                Node<K, V> r = new ReservationNode<K, V>();
+                synchronized (r) {
+                    // CAS 操作将桶中的 null 更新成占位节点 
+                    if (casTabAt(tab, i, null, r)) {
+                        binCount = 1;
+                        Node<K, V> node = null;
+                        try {
+                            // 计算 key 对应的 value
+                            if ((val = mappingFunction.apply(key)) != null)
+                                // value 不为 null 创建链表节点
+                                node = new Node<K, V>(h, key, val);
+                        } finally {
+                            // 将链表节点添加到桶中
+                            setTabAt(tab, i, node);
+                        }
+                    }
+                }
+                if (binCount != 0)
+                    break;
+            }
+            // 协助扩容
+            else if ((fh = f.hash) == MOVED)
+                tab = helpTransfer(tab, f);
+            // 如果桶中的第一个节点 key 能和现在这个 key 完成匹配，那么直接返回它的值
+            else if (fh == h && ((fk = f.key) == key || (fk != null && key.equals(fk))) && (fv = f.val) != null)
+                return fv;
+            // 否则，遍历寻找
+            else {
+                boolean added = false;
+                synchronized (f) {
+                    if (tabAt(tab, i) == f) {
+                        if (fh >= 0) {
+                            binCount = 1;
+                            for (Node<K, V> e = f; ; ++binCount) {
+                                K ek;
+                                // 匹配到对应节点，为 val 赋值并结束循环
+                                if (e.hash == h && ((ek = e.key) == key || (ek != null && key.equals(ek)))) {
+                                    val = e.val;
+                                    break;
+                                }
+                                Node<K, V> pred = e;
+                                // 没找到这个节点创建一个
+                                if ((e = e.next) == null) {
+                                    if ((val = mappingFunction.apply(key)) != null) {
+                                        if (pred.next != null)
+                                            throw new IllegalStateException("Recursive update");
+                                        added = true;
+                                        pred.next = new Node<K, V>(h, key, val);
+                                    }
+                                    break;
+                                }
+                            }
+                        } else if (f instanceof TreeBin) {
+                            binCount = 2;
+                            TreeBin<K, V> t = (TreeBin<K, V>) f;
+                            TreeNode<K, V> r, p;
+                            if ((r = t.root) != null &&
+                                    (p = r.findTreeNode(h, key, null)) != null)
+                                val = p.val;
+                            else if ((val = mappingFunction.apply(key)) != null) {
+                                added = true;
+                                t.putTreeVal(h, key, val);
+                            }
+                        } else if (f instanceof ReservationNode)
+                            throw new IllegalStateException("Recursive update");
+                    }
+                }
+                if (binCount != 0) {
+                    if (binCount >= TREEIFY_THRESHOLD)
+                        treeifyBin(tab, i);
+                    if (!added)
+                        return val;
+                    break;
+                }
+            }
+        }
+        if (val != null)
+            addCount(1L, binCount);
+        return val;
+    }
+}
+```
+
 到这里 `ConcurrentHashMap` 中的源码大部分已经介绍完了，接下来我们简单谈一些有意思的问题。
 
 ### key 和 value 不能为 null 的妙用
