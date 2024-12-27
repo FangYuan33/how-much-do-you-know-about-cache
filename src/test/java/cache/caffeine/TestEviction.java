@@ -147,4 +147,40 @@ public class TestEviction {
 
     }
 
+    @Test
+    public void listener() {
+        // 创建一个缓存，在缓存元素被移除时触发监听器
+        Cache<String, String> cache = Caffeine.newBuilder()
+                .removalListener((String key, String value, RemovalCause cause) -> {
+                    System.out.println("Key " + key + " was removed (" + cause + ")");
+                })
+                .build();
+
+        cache.put("key1", "value1");
+        cache.put("key2", "value2");
+
+        cache.invalidate("key1");
+        cache.invalidateAll();
+
+
+        // 创建一个最大容量为 100 的缓存，并创建移除策略的监听器
+        Cache<String, String> cache2 = Caffeine.newBuilder()
+                .maximumSize(100)
+                .evictionListener((String key, String value, RemovalCause cause) -> {
+                    System.out.println("Key " + key + " was removed (" + cause + ")");
+                })
+                .build();
+
+        // 插入数据
+        for (int i = 0; i < 200; i++) {
+            cache2.put("key" + i, "value" + i);
+        }
+
+        // 获取数据
+        String value = cache2.getIfPresent("key1");
+        System.out.println("Value for key1: " + value);
+
+        String value2 = cache2.getIfPresent("key1");
+        System.out.println("Value for key1: " + value2);
+    }
 }
