@@ -36,7 +36,7 @@ public class TestPopulation {
         System.out.println(cache.getIfPresent(key));
     }
 
-    // 自动加载
+    // 自动加载，需要为 build 方法指定 LoadCache 参数，缓存对象为 LoadingCache
     @Test
     public void loading() {
         // LoadingCache 是一个 Cache 附加上 CacheLoader 能力之后的缓存实现
