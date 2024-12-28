@@ -451,6 +451,88 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 在这个过程中我们简单了解了 `put` 添加缓存中不存在的元素的处理流程，需要知道元素是被直接添加到 `ConcurrentHashMap data` 中的，至于其他驱逐、过期等维护操作是由任务异步驱动完成的，而且只能由单线程去处理，至于其中详细的逻辑在后文中介绍。
 
-### get
+### getIfPresent
 
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
 
+    final ConcurrentHashMap<Object, Node<K, V>> data;
+
+    final Buffer<Node<K, V>> readBuffer;
+    
+    @Override
+    public @Nullable V getIfPresent(Object key, boolean recordStats) {
+        // 直接由 ConcurrentHashMap 获取元素
+        Node<K, V> node = data.get(nodeFactory.newLookupKey(key));
+        if (node == null) {
+            // 更新统计未命中
+            if (recordStats) {
+                statsCounter().recordMisses(1);
+            }
+            // 当前 drainStatus 为 REQUIRED 表示有任务需要处理则调度处理
+            if (drainStatusOpaque() == REQUIRED) {
+                scheduleDrainBuffers();
+            }
+            return null;
+        }
+
+        V value = node.getValue();
+        long now = expirationTicker().read();
+        // 判断是否过期或者需要被回收且value对应的值为null
+        if (hasExpired(node, now) || (collectValues() && (value == null))) {
+            // 更新统计未命中
+            if (recordStats) {
+                statsCounter().recordMisses(1);
+            }
+            scheduleDrainBuffers();
+            return null;
+        }
+
+        // 检查节点没有在进行异步计算
+        if (!isComputingAsync(node)) {
+            @SuppressWarnings("unchecked")
+            K castedKey = (K) key;
+            // 更新访问时间
+            setAccessTime(node, now);
+            // 更新读后过期时间
+            tryExpireAfterRead(node, castedKey, value, expiry(), now);
+        }
+        // 处理读取后操作
+        V refreshed = afterRead(node, now, recordStats);
+        return (refreshed == null) ? value : refreshed;
+    }
+
+    @Nullable V afterRead(Node<K, V> node, long now, boolean recordHit) {
+        // 更新统计命中
+        if (recordHit) {
+            statsCounter().recordHits(1);
+        }
+
+        // 注意这里如果 readBuffer 已经被初始化不需要被跳过，它会执行 readBuffer.offer(node) 逻辑，添加待处理元素
+        // 没有满的话为 true
+        boolean delayable = skipReadBuffer() || (readBuffer.offer(node) != Buffer.FULL);
+        // 判断是否需要处理维护任务
+        if (shouldDrainBuffers(delayable)) {
+            scheduleDrainBuffers();
+        }
+        // 处理必要的刷新操作
+        return refreshIfNeeded(node, now);
+    }
+
+    // 状态流转，没有满 delayable 为 true 表示延迟执行维护任务
+    boolean shouldDrainBuffers(boolean delayable) {
+        switch (drainStatusOpaque()) {
+            case IDLE:
+                return !delayable;
+            // 当前有任务需要处理则调度维护任务执行，否则均延迟执行    
+            case REQUIRED:
+                return true;
+            case PROCESSING_TO_IDLE:
+            case PROCESSING_TO_REQUIRED:
+                return false;
+            default:
+                throw new IllegalStateException("Invalid drain status: " + drainStatus);
+        }
+    }
+}
+```
