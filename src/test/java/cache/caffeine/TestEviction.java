@@ -33,14 +33,21 @@ public class TestEviction {
 
     @Test
     public void weight() {
-        // 创建一个最大权重为 1000 的缓存
+        // 创建一个最大权重为 1 的缓存
         Cache<String, String> cache = Caffeine.newBuilder()
                 .maximumWeight(1)
                 // 指定计算每对 entry 的权重
-                .weigher((String key, String value) -> value.length())
+                .weigher((String key, String value) -> {
+                    // 在权重中指定为 0 它不会被移除
+                    if ("key0".equals(key)) {
+                        return 0;
+                    }
+                    return value.length();
+                })
                 .build();
 
         // 插入数据
+        cache.put("key0", "value0");
         cache.put("key1", "value1");
         cache.put("key2", "value2");
 
@@ -57,15 +64,19 @@ public class TestEviction {
         // 创建一个写入后 5 秒自动过期的缓存
         Cache<String, String> cache = Caffeine.newBuilder()
                 // 一个元素将会在其创建或者最近一次被 更新 之后的一段时间后被认定为过期项
-                .expireAfterWrite(5, TimeUnit.SECONDS)
+//                .expireAfterWrite(5, TimeUnit.SECONDS)
                 // 一个元素在上一次 读写 操作后一段时间之后，在指定的时间后没有被再次访问将会被认定为过期项
 //                .expireAfterAccess(5, TimeUnit.SECONDS)
                 //
                 .expireAfter(new Expiry<Object, Object>() {
                     @Override
                     public long expireAfterCreate(Object key, Object value, long currentTime) {
-                        // 设置条目在创建后 10 秒过期
-                        return TimeUnit.SECONDS.toNanos(10);
+                        // 指定过期时间为 Long.MAX_VALUE 则不会过期
+                        if  ("key0".equals(key)) {
+                            return Long.MAX_VALUE;
+                        }
+                        // 设置条目在创建后 5 秒过期
+                        return TimeUnit.SECONDS.toNanos(5);
                     }
 
                     @Override
@@ -86,10 +97,13 @@ public class TestEviction {
 
         // 插入数据
         cache.put("key1", "value1");
+        cache.put("key0", "value0");
 
         // 获取数据
         String value = cache.getIfPresent("key1");
         System.out.println("Value for key1: " + value);
+        String value0 = cache.getIfPresent("key0");
+        System.out.println("Value for key0: " + value0);
 
         // 等待 6 秒
         try {
@@ -101,6 +115,8 @@ public class TestEviction {
         // 获取数据
         value = cache.getIfPresent("key1");
         System.out.println("Value for key1 after 6 seconds: " + value);
+        value0 = cache.getIfPresent("key0");
+        System.out.println("Value for key0 after 6 seconds: " + value0);
     }
 
     // 模拟时钟
