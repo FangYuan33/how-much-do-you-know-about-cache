@@ -7,13 +7,15 @@ import org.junit.jupiter.api.Test;
 public class TestReadSourceCode {
 
     @Test
-    public void readPut() {
+    public void doRead() {
         Cache<String, String> cache = Caffeine.newBuilder()
                 .maximumSize(10_000)
                 .build();
 
+        // read put
         cache.put("key", "value");
 
+        // read get
         cache.getIfPresent("key");
     }
 

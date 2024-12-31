@@ -2,6 +2,8 @@
 
 为了代码复用使用了多级继承，以某个为例画类图
 
+`S|W S|I [L] [S] [MW|MS] [A] [W] [R]`
+
 ```java
 interface LocalCacheFactory {
 
@@ -54,6 +56,8 @@ interface LocalCacheFactory {
     }
 }
 ```
+
+`P|F S|W|D A|AW|W| [R] [MW|MS]`
 
 ```java
 interface NodeFactory<K, V> {
@@ -333,7 +337,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             expireEntries();
             evictEntries();
 
-            // 其他操作，后续我们再重点讲
+            // “增值” 操作，后续重点讲
             climb();
         } finally {
             // 状态不是 PROCESSING_TO_IDLE 或者无法 CAS 更新为 IDLE 状态的话，需要更新状态为 REQUIRED，该状态会再次执行维护任务
@@ -351,7 +355,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
 
     static final long MAXIMUM_CAPACITY = Long.MAX_VALUE - Integer.MAX_VALUE;
-    
+
     final class AddTask implements Runnable {
         final Node<K, V> node;
         final int weight;
@@ -449,7 +453,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-在这个过程中我们简单了解了 `put` 添加缓存中不存在的元素的处理流程，需要知道元素是被直接添加到 `ConcurrentHashMap data` 中的，至于其他驱逐、过期等维护操作是由任务异步驱动完成的，而且只能由单线程去处理，至于其中详细的逻辑在后文中介绍。
+在这个过程中我们简单了解了 `put` 添加缓存中不存在的元素的处理流程，需要知道元素是被直接添加到 `ConcurrentHashMap data`
+中的，至于其他驱逐、过期等维护操作是由任务异步驱动完成的，而且只能由单线程去处理，至于其中详细的逻辑在后文中介绍。
 
 ### getIfPresent
 
@@ -459,7 +464,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
     final ConcurrentHashMap<Object, Node<K, V>> data;
 
     final Buffer<Node<K, V>> readBuffer;
-    
+
     @Override
     public @Nullable V getIfPresent(Object key, boolean recordStats) {
         // 直接由 ConcurrentHashMap 获取元素
@@ -502,7 +507,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         return (refreshed == null) ? value : refreshed;
     }
 
-    @Nullable V afterRead(Node<K, V> node, long now, boolean recordHit) {
+    @Nullable
+    V afterRead(Node<K, V> node, long now, boolean recordHit) {
         // 更新统计命中
         if (recordHit) {
             statsCounter().recordHits(1);
@@ -534,5 +540,210 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                 throw new IllegalStateException("Invalid drain status: " + drainStatus);
         }
     }
+}
+```
+
+### maintenance
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    @GuardedBy("evictionLock")
+    void maintenance(@Nullable Runnable task) {
+        // 更新状态为执行中
+        setDrainStatusRelease(PROCESSING_TO_IDLE);
+
+        try {
+            // 1. 处理读缓冲区中的任务
+            drainReadBuffer();
+
+            // 2. 处理写缓冲区中的任务
+            drainWriteBuffer();
+            if (task != null) {
+                task.run();
+            }
+
+            // 3. 处理 key 和 value 的引用
+            drainKeyReferences();
+            drainValueReferences();
+
+            // 4. 过期和驱逐策略
+            expireEntries();
+            evictEntries();
+
+            // 5. “增值” 操作
+            climb();
+        } finally {
+            // 状态不是 PROCESSING_TO_IDLE 或者无法 CAS 更新为 IDLE 状态的话，需要更新状态为 REQUIRED，该状态会再次执行维护任务
+            if ((drainStatusOpaque() != PROCESSING_TO_IDLE) || !casDrainStatus(PROCESSING_TO_IDLE, IDLE)) {
+                setDrainStatusOpaque(REQUIRED);
+            }
+        }
+    }
+}
+```
+
+首先我们来看步骤一处理读缓冲区：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    final Buffer<Node<K, V>> readBuffer;
+
+    final Consumer<Node<K, V>> accessPolicy;
+    
+    @GuardedBy("evictionLock")
+    void drainReadBuffer() {
+        if (!skipReadBuffer()) {
+            readBuffer.drainTo(accessPolicy);
+        }
+    }
+    
+}
+```
+
+它在这里会执行到 `BoundedBuffer#drainTo` 方法，并且入参了 `Consumer<Node<K, V>> accessPolicy` 
+
+```java
+final class BoundedBuffer<E> extends StripedBuffer<E> {
+    static final class RingBuffer<E> extends BBHeader.ReadAndWriteCounterRef implements Buffer<E> {
+        static final VarHandle BUFFER = MethodHandles.arrayElementVarHandle(Object[].class);
+
+        @Override
+        public void drainTo(Consumer<E> consumer) {
+            long head = readCounter;
+            long tail = writeCounterOpaque();
+            long size = (tail - head);
+            if (size == 0) {
+                return;
+            }
+            do {
+                int index = (int) (head & MASK);
+                @SuppressWarnings("unchecked")
+                E e = (E) BUFFER.getAcquire(buffer, index);
+                if (e == null) {
+                    // not published yet
+                    break;
+                }
+                BUFFER.setRelease(buffer, index, null);
+                consumer.accept(e);
+                head++;
+            } while (head != tail);
+            setReadCounterOpaque(head);
+        }
+    }
+}
+```
+
+接下来我们看一下为 `accessPolicy` 赋值的逻辑
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    final Buffer<Node<K, V>> readBuffer;
+
+    final Consumer<Node<K, V>> accessPolicy;
+
+    protected BoundedLocalCache(Caffeine<K, V> builder,
+                                @Nullable AsyncCacheLoader<K, V> cacheLoader, boolean isAsync) {
+        accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {};
+    }
+
+    @GuardedBy("evictionLock")
+    void onAccess(Node<K, V> node) {
+        if (evicts()) {
+            K key = node.getKey();
+            if (key == null) {
+                return;
+            }
+            // 更新访问频率
+            frequencySketch().increment(key);
+            // 根据节点所在位置执行对应的重排序方法
+            if (node.inWindow()) {
+                reorder(accessOrderWindowDeque(), node);
+            }
+            // 在试用区的节点执行 reorderProbation 方法，可能会将该节点从试用区晋升到保护区
+            else if (node.inMainProbation()) {
+                reorderProbation(node);
+            } else {
+                reorder(accessOrderProtectedDeque(), node);
+            }
+            setHitsInSample(hitsInSample() + 1);
+        } else if (expiresAfterAccess()) {
+            reorder(accessOrderWindowDeque(), node);
+        }
+        if (expiresVariable()) {
+            timerWheel().reschedule(node);
+        }
+    }
+
+    static <K, V> void reorder(LinkedDeque<Node<K, V>> deque, Node<K, V> node) {
+        // 如果节点存在，将其移动到尾结点
+        if (deque.contains(node)) {
+            deque.moveToBack(node);
+        }
+    }
+
+    @GuardedBy("evictionLock")
+    void reorderProbation(Node<K, V> node) {
+        // 检查试用区是否包含该节点，不包含则证明已经被移除，则不处理
+        if (!accessOrderProbationDeque().contains(node)) {
+            return;
+        } 
+        // 检查节点的权重是否超过保护区最大值
+        else if (node.getPolicyWeight() > mainProtectedMaximum()) {
+            // 如果超过，将该节点移动到 试用区 尾巴节点，保证超重的节点不会被移动到保护区
+            reorder(accessOrderProbationDeque(), node);
+            return;
+        }
+
+
+        // 更新保护区权重大小
+        setMainProtectedWeightedSize(mainProtectedWeightedSize() + node.getPolicyWeight());
+        // 在试用区中移除该节点
+        accessOrderProbationDeque().remove(node);
+        // 在保护区尾节点中添加
+        accessOrderProtectedDeque().offerLast(node);
+        // 将该节点标记为保护区节点
+        node.makeMainProtected();
+    }
+}
+```
+
+在这个方法中有一段注释非常重要，它说：
+
+> If the protected space exceeds its maximum, the LRU items are demoted to the probation space.
+> This is deferred to the adaption phase at the end of the maintenance cycle.
+
+如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行。
+
+Main Probation: 试用区
+
+Main Protected: 保护区
+
+那么，我们在这里假设，执行 `maintenance` 方法时其他处理写缓冲区方法等均无需特别处理，直接跳转到最后的 `climb`，看看它是如何为缓存“增值”的：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    @GuardedBy("evictionLock")
+    void climb() {
+        if (!evicts()) {
+            return;
+        }
+
+        // 
+        determineAdjustment();
+        demoteFromMainProtected();
+        long amount = adjustment();
+        if (amount == 0) {
+            return;
+        } else if (amount > 0) {
+            increaseWindow();
+        } else {
+            decreaseWindow();
+        }
+    }
+    
 }
 ```
