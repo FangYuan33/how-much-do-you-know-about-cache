@@ -8,6 +8,7 @@ public class TestReadSourceCode {
 
     @Test
     public void doRead() {
+        // read constructor
         Cache<String, String> cache = Caffeine.newBuilder()
                 .maximumSize(10_000)
                 .build();

@@ -1,8 +1,104 @@
-在 `com.github.benmanes.caffeine.cache` 包路径下能发现很多类似 `SSMSW` 只有简称的命名
+我们先以简单的创建一个固定大小的缓存为例
 
-为了代码复用使用了多级继承，以某个为例画类图
+```java
+public class TestReadSourceCode {
 
-`S|W S|I [L] [S] [MW|MS] [A] [W] [R]`
+    @Test
+    public void doRead() {
+        // read constructor
+        Cache<String, String> cache = Caffeine.newBuilder()
+                .maximumSize(10_000)
+                .build();
+
+        // read put
+        cache.put("key", "value");
+
+        // read get
+        cache.getIfPresent("key");
+    }
+
+}
+```
+
+### constructor
+
+在 Caffeine 的构造方法中，区分了 `BoundedLocalManualCache` 和 `UnboundedLocalManualCache`
+，见名知意它们分别为有“边界”的和无“边界”的缓存，`isBounded` 方法诠释了“边界”的含义：
+
+```java
+public final class Caffeine<K, V> {
+
+    static final int UNSET_INT = -1;
+
+    public <K1 extends K, V1 extends V> Cache<K1, V1> build() {
+        // 校验参数
+        requireWeightWithWeigher();
+        requireNonLoadingCache();
+
+        @SuppressWarnings("unchecked")
+        Caffeine<K1, V1> self = (Caffeine<K1, V1>) this;
+        return isBounded()
+                ? new BoundedLocalCache.BoundedLocalManualCache<>(self)
+                : new UnboundedLocalCache.UnboundedLocalManualCache<>(self);
+    }
+
+    boolean isBounded() {
+        // 指定了最大大小；指定了最大权重
+        return (maximumSize != UNSET_INT) || (maximumWeight != UNSET_INT)
+                // 指定了访问后过期策略；指定了写后过期策略
+                || (expireAfterAccessNanos != UNSET_INT) || (expireAfterWriteNanos != UNSET_INT)
+                // 指定了自定义过期策略；指定了 key 或 value 的引用级别
+                || (expiry != null) || (keyStrength != null) || (valueStrength != null);
+    }
+}
+```
+
+也就是说，当为缓存指定了上述的驱逐或过期策略会定义为有边界的 `BoundedLocalManualCache`
+缓存，它会限制缓存的大小，防止内存溢出，否则为无边界的 `UnboundedLocalManualCache`
+缓存，它没有大小限制，直到内存耗尽。`UnboundedLocalManualCache`
+实现相对简单，本文不会对它进行介绍，会主要关注 `BoundedLocalManualCache`，它在执行构造方法时，有以下逻辑：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
+        implements LocalCache<K, V> {
+    // ...
+
+    static class BoundedLocalManualCache<K, V> implements LocalManualCache<K, V>, Serializable {
+        private static final long serialVersionUID = 1;
+
+        final BoundedLocalCache<K, V> cache;
+
+        BoundedLocalManualCache(Caffeine<K, V> builder) {
+            this(builder, null);
+        }
+
+        BoundedLocalManualCache(Caffeine<K, V> builder, @Nullable CacheLoader<? super K, V> loader) {
+            cache = LocalCacheFactory.newBoundedLocalCache(builder, loader, /* async */ false);
+        }
+    }
+}
+```
+
+我们可以发现 `BoundedLocalCache` 为抽象类，创建对象的实际类型应该是它的子类，而且它在创建时，使用了反射并遵循简单工厂的编码风格：
+
+```java
+interface LocalCacheFactory {
+    static <K, V> BoundedLocalCache<K, V> newBoundedLocalCache(Caffeine<K, V> builder,
+                                                               @Nullable AsyncCacheLoader<? super K, V> cacheLoader, boolean async) {
+        var className = getClassName(builder);
+        var factory = loadFactory(className);
+        try {
+            return factory.newInstance(builder, cacheLoader, async);
+        } catch (RuntimeException | Error e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new IllegalStateException(className, t);
+        }
+    }
+}
+```
+
+`getClassName` 非常有意思，它会根据为缓存设置的一些属性动态的拼接出列名：
 
 ```java
 interface LocalCacheFactory {
@@ -57,7 +153,17 @@ interface LocalCacheFactory {
 }
 ```
 
-`P|F S|W|D A|AW|W| [R] [MW|MS]`
+这也就是为什么能在 `com.github.benmanes.caffeine.cache` 包路径下能发现很多类似 `SSMW` 只有简称命名的类（下图只截取部分，实际上有很多）：
+
+![img.png](SSMS.png)
+
+根据代码，它的命名遵循如下格式 `S|W S|I [L] [S] [MW|MS] [A] [W] [R]` 其中 `[]` 表示选填 `|`
+为某位置不同选择的分隔符，结合注释能清楚的了解各个位置字母表达的含义。如此定义使用了多级继承，尽可能多地复用代码，以我们测试用例中创建的 `SSMS`
+为例，它表示 key 和 value 均为强引用并且配置了非权重的最大缓存大小，类图关系如下：
+
+![img.png](SSMS.drawio.png)
+
+虽然在一些软件设计相关的书籍中强调“多用组合，少用继承”，但是这里使用多级继承我觉得并没有增加开发者的理解难度，反而了解了它的命名规则后，能更清晰的理解各个缓存所表示的含义，实现代码复用。除了缓存的定义遵循这样的命名规则，节点类的定义也是用了这种方式，如下：
 
 ```java
 interface NodeFactory<K, V> {
@@ -122,6 +228,201 @@ interface NodeFactory<K, V> {
 
 }
 ```
+
+它的命名遵循 `P|F S|W|D A|AW|W| [R] [MW|MS]` 的规则，在后文中创建节点时，便不再对此进行赘述了。接下来我们回到 `SSMS`
+类型缓存的构造方法逻辑中，它会依次执行如下逻辑：
+
+```java
+// 1
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
+        implements LocalCache<K, V> {
+
+    static final int WRITE_BUFFER_MIN = 4;
+    static final int WRITE_BUFFER_MAX = 128 * ceilingPowerOfTwo(NCPU);
+
+    static final long MAXIMUM_CAPACITY = Long.MAX_VALUE - Integer.MAX_VALUE;
+
+    static final double PERCENT_MAIN = 0.99d;
+    static final double PERCENT_MAIN_PROTECTED = 0.80d;
+
+    static final double HILL_CLIMBER_STEP_PERCENT = 0.0625d;
+
+    final @Nullable RemovalListener<K, V> evictionListener;
+    final @Nullable AsyncCacheLoader<K, V> cacheLoader;
+
+    final MpscGrowableArrayQueue<Runnable> writeBuffer;
+    final ConcurrentHashMap<Object, Node<K, V>> data;
+    final PerformCleanupTask drainBuffersTask;
+    final Consumer<Node<K, V>> accessPolicy;
+    final Buffer<Node<K, V>> readBuffer;
+    final NodeFactory<K, V> nodeFactory;
+    final ReentrantLock evictionLock;
+    final Weigher<K, V> weigher;
+    final Executor executor;
+
+    final boolean isAsync;
+    final boolean isWeighted;
+
+    protected BoundedLocalCache(Caffeine<K, V> builder,
+                                @Nullable AsyncCacheLoader<K, V> cacheLoader, boolean isAsync) {
+        // 标记同步或异步
+        this.isAsync = isAsync;
+        // 指定 cacheLoader 
+        this.cacheLoader = cacheLoader;
+        // 指定用于执行驱逐元素、刷新缓存等任务的线程池，不指定默认为 ForkJoinPool.commonPool()
+        executor = builder.getExecutor();
+        // 标记是否定义了节点计算权重的 Weigher 对象
+        isWeighted = builder.isWeighted();
+        // 同步锁，在接下来的内容中会看到很多标记了 @GuardedBy("evictionLock") 注解的方法，表示这行这些方法时都会获取这把同步锁
+        evictionLock = new ReentrantLock();
+        // 计算元素权重的对象，不指定为 SingletonWeigher.INSTANCE
+        weigher = builder.getWeigher(isAsync);
+        // 执行缓存 maintenance 方法的任务，在后文中具体介绍
+        drainBuffersTask = new PerformCleanupTask(this);
+        // 创建节点的工厂
+        nodeFactory = NodeFactory.newFactory(builder, isAsync);
+        // 驱逐监听器，有元素被驱逐时会回调
+        evictionListener = builder.getEvictionListener(isAsync);
+        // 用于保存所有数据的 ConcurrentHashMap
+        data = new ConcurrentHashMap<>(builder.getInitialCapacity());
+        // 如果指定驱逐策略 或 key为弱引用 或 value为弱引用 或 访问后过期则创建 readBuffer，否则它为不可用状态
+        // readBuffer 用于记录某些被访问过的节点，这些节点
+        readBuffer = evicts() || collectKeys() || collectValues() || expiresAfterAccess()
+                ? new BoundedBuffer<>() : Buffer.disabled();
+        // 如果指定了驱逐策略 或 访问后过期策略则会定义访问策略，执行 onAccess 方法，后文详细介绍
+        accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {
+        };
+        // 初始化最大值和最小值的双端队列作为 writeBuffer，用于记录一些写后操作任务 
+        writeBuffer = new MpscGrowableArrayQueue<>(WRITE_BUFFER_MIN, WRITE_BUFFER_MAX);
+
+        // 执行了驱逐策略则更新最大容量限制
+        if (evicts()) {
+            setMaximumSize(builder.getMaximum());
+        }
+    }
+
+    @GuardedBy("evictionLock")
+    void setMaximumSize(long maximum) {
+        requireArgument(maximum >= 0, "maximum must not be negative");
+        if (maximum == maximum()) {
+            return;
+        }
+
+        // 不能超过最大容量
+        long max = Math.min(maximum, MAXIMUM_CAPACITY);
+        // 计算窗口区大小
+        long window = max - (long) (PERCENT_MAIN * max);
+        // 计算保护区大小
+        long mainProtected = (long) (PERCENT_MAIN_PROTECTED * (max - window));
+
+        // 记录这些值
+        setMaximum(max);
+        setWindowMaximum(window);
+        setMainProtectedMaximum(mainProtected);
+
+        // 标记命中量、非命中量并初始化步长值，这三个值用于后续动态调整保护区和窗口区大小
+        setHitsInSample(0);
+        setMissesInSample(0);
+        setStepSize(-HILL_CLIMBER_STEP_PERCENT * max);
+
+        // 直到当前缓存的权重（大小）接近最大值时才初始化频率草图
+        if ((frequencySketch() != null) && !isWeighted() && (weightedSize() >= (max >>> 1))) {
+            frequencySketch().ensureCapacity(max);
+        }
+    }
+}
+
+// 2
+class SS<K, V> extends BoundedLocalCache<K, V> {
+    static final LocalCacheFactory FACTORY = SS::new;
+
+    // key value 强引用无需特殊操作
+    SS(Caffeine<K, V> var1, @Nullable AsyncCacheLoader<? super K, V> var2, boolean var3) {
+        super(var1, var2, var3);
+    }
+}
+
+// 3
+class SSMS<K, V> extends SS<K, V> {
+
+    final FrequencySketch<K> sketch = new FrequencySketch();
+
+    final AccessOrderDeque<Node<K, V>> accessOrderWindowDeque;
+    final AccessOrderDeque<Node<K, V>> accessOrderProbationDeque;
+    final AccessOrderDeque<Node<K, V>> accessOrderProtectedDeque;
+
+    SSMS(Caffeine<K, V> var1, @Nullable AsyncCacheLoader<? super K, V> var2, boolean var3) {
+        super(var1, var2, var3);
+        // 如果 caffeine 初始化了容量则确定频率草图的容量
+        if (var1.hasInitialCapacity()) {
+            long var4 = Math.min(var1.getMaximum(), (long) var1.getInitialCapacity());
+            this.sketch.ensureCapacity(var4);
+        }
+
+        // 初始化窗口区、试用区和保护区，它们都是双端队列（链表实现）
+        this.accessOrderWindowDeque = !var1.evicts() && !var1.expiresAfterAccess() ? null : new AccessOrderDeque();
+        this.accessOrderProbationDeque = new AccessOrderDeque();
+        this.accessOrderProtectedDeque = new AccessOrderDeque();
+    }
+}
+```
+
+> 注释中描述的驱逐或访问过期策略可以在创建 `Caffeine` 缓存时指定，指定最大缓存容量也是缓存的驱逐策略之一。
+
+在步骤 1 中我们需要解释一下 `weightedSize()` 方法，它用于访问 `long weightedSize`
+变量。根据其命名有“权重大小”的含义，在默认不指定权重计算对象 `Weigher` 的情况下，`Weigher`
+默认为 `SingletonWeigher.INSTANCE` 表示每个元素的权重大小为 1，如下：
+
+```java
+enum SingletonWeigher implements Weigher<Object, Object> {
+    INSTANCE;
+
+    @Override
+    public int weigh(Object key, Object value) {
+        return 1;
+    }
+}
+```
+
+这样 `weightedSize` 表示的便是当前缓存中元素数量，如果自定义了 `Weigher` 那么 `weightedSize`
+表示的便是缓存中总权重大小，每个元素的权重则可能会不同。因为在示例中我们并没有指定 `Weigher`
+，所以在此处可以将 `weightedSize` 理解为当前缓存大小。
+
+到这里，`Caffeine` 缓存的基本数据结构全貌已经展现出来了，下面我们具体介绍下其中的 `FrequencySketch` 数据结构。
+
+这个类使用 **Count-Min Sketch** 算法计算某个元素的访问频率。它维护了一个 `long[] table` 一维数组，每个元素有 64 位，每 4 位作为一个计数器，那么数组中每个槽位便是 16 个计数器。通过哈希函数取 4 个独立的计数值，将其中的最小值作为元素的访问频率。`table` 的初始大小为缓存最大容量最接近的 2 的 n 次幂，并在计算哈希值时使用 `blockMask` 掩码来使哈希结果均匀分布，保证了获取元素访问频率的正确率为 93.75%，达到空间与时间的平衡。它的实现原理和布隆过滤器类似，牺牲了部分准确性，但减少了消耗的内存大小。
+
+```java
+final class FrequencySketch<E> {
+
+    static final long RESET_MASK = 0x7777777777777777L;
+    static final long ONE_MASK = 0x1111111111111111L;
+
+    int sampleSize;
+    int blockMask;
+    long[] table;
+    int size;
+
+    public FrequencySketch() {}
+    
+    public void ensureCapacity(@NonNegative long maximumSize) {
+        requireArgument(maximumSize >= 0);
+        int maximum = (int) Math.min(maximumSize, Integer.MAX_VALUE >>> 1);
+        if ((table != null) && (table.length >= maximum)) {
+            return;
+        }
+
+        table = new long[Math.max(Caffeine.ceilingPowerOfTwo(maximum), 8)];
+        sampleSize = (maximumSize == 0) ? 10 : (10 * maximum);
+        blockMask = (table.length >>> 3) - 1;
+        if (sampleSize <= 0) {
+            sampleSize = Integer.MAX_VALUE;
+        }
+        size = 0;
+    }
+}
+```
+
 
 ### put
 
@@ -889,7 +1190,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         // 将未完成调整的 quota 记录在调整值中
         setAdjustment(quota);
     }
-    
+
     @GuardedBy("evictionLock")
     void decreaseWindow() {
         // 如果窗口区大小小于等于 1 则无法再减少了
