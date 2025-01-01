@@ -388,9 +388,16 @@ enum SingletonWeigher implements Weigher<Object, Object> {
 表示的便是缓存中总权重大小，每个元素的权重则可能会不同。因为在示例中我们并没有指定 `Weigher`
 ，所以在此处可以将 `weightedSize` 理解为当前缓存大小。
 
-到这里，`Caffeine` 缓存的基本数据结构全貌已经展现出来了，下面我们具体介绍下其中的 `FrequencySketch` 数据结构。
+除此之外我们还需要具体介绍下 `FrequencySketch`。这个类使用 **Count-Min Sketch**
+算法计算某个元素的访问频率。它维护了一个 `long[] table` 一维数组，每个元素有 64 位，每 4 位作为一个计数器（这也就限定了最大频率为
+15），那么数组中每个槽位便是 16 个计数器。通过哈希函数取 4 个独立的计数值，将其中的最小值作为元素的访问频率。`table`
+的初始大小为缓存最大容量最接近的 2 的 n 次幂，并在计算哈希值时使用 `blockMask` 掩码来使哈希结果均匀分布，保证了获取元素访问频率的正确率为
+93.75%，达到空间与时间的平衡。它的实现原理和布隆过滤器类似，牺牲了部分准确性，但减少了占用内存的大小。如下图所示为计算元素 e
+的访问频率：
 
-这个类使用 **Count-Min Sketch** 算法计算某个元素的访问频率。它维护了一个 `long[] table` 一维数组，每个元素有 64 位，每 4 位作为一个计数器，那么数组中每个槽位便是 16 个计数器。通过哈希函数取 4 个独立的计数值，将其中的最小值作为元素的访问频率。`table` 的初始大小为缓存最大容量最接近的 2 的 n 次幂，并在计算哈希值时使用 `blockMask` 掩码来使哈希结果均匀分布，保证了获取元素访问频率的正确率为 93.75%，达到空间与时间的平衡。它的实现原理和布隆过滤器类似，牺牲了部分准确性，但减少了消耗的内存大小。
+![frequencySketch.drawio.png](frequencySketch.drawio.png)
+
+以下为 `FrequencySketch` 的源码，关注注释即可，并不复杂：
 
 ```java
 final class FrequencySketch<E> {
@@ -398,31 +405,143 @@ final class FrequencySketch<E> {
     static final long RESET_MASK = 0x7777777777777777L;
     static final long ONE_MASK = 0x1111111111111111L;
 
+    // 采样大小，用于控制 reset
     int sampleSize;
+    // 掩码，用于均匀分散哈希结果
     int blockMask;
     long[] table;
     int size;
 
-    public FrequencySketch() {}
-    
+    public FrequencySketch() {
+    }
+
     public void ensureCapacity(@NonNegative long maximumSize) {
         requireArgument(maximumSize >= 0);
+        // 取缓存最大容量和 Integer.MAX_VALUE >>> 1 中的小值 
         int maximum = (int) Math.min(maximumSize, Integer.MAX_VALUE >>> 1);
+        // 如果已经被初始化过并且 table 长度大于等于最大容量，那么不进行操作
         if ((table != null) && (table.length >= maximum)) {
             return;
         }
 
+        // 初始化 table，长度为最接近 maximum 的 2的n次幂和 8 中的大值
         table = new long[Math.max(Caffeine.ceilingPowerOfTwo(maximum), 8)];
+        // 计算采样大小
         sampleSize = (maximumSize == 0) ? 10 : (10 * maximum);
+        // 计算掩码
         blockMask = (table.length >>> 3) - 1;
+        // 特殊判断
         if (sampleSize <= 0) {
             sampleSize = Integer.MAX_VALUE;
         }
+        // 计数器总数
         size = 0;
     }
+
+    @NonNegative
+    public int frequency(E e) {
+        // 如果缓存没有被初始化则返回频率为 0
+        if (isNotInitialized()) {
+            return 0;
+        }
+
+        // 创建 4 个元素的数组 count 用于保存 4 次 hash 计算出的频率值
+        int[] count = new int[4];
+        // hash 扰动，使结果均匀分布
+        int blockHash = spread(e.hashCode());
+        // 重 hash，进一步分散结果
+        int counterHash = rehash(blockHash);
+        // 根据掩码计算对应的块索引
+        int block = (blockHash & blockMask) << 3;
+        // 循环 4 次计算 4 个计数器的结果
+        for (int i = 0; i < 4; i++) {
+            // 位运算变更 hash 值
+            int h = counterHash >>> (i << 3);
+            int index = (h >>> 1) & 15;
+            // 计算计数器的偏移量
+            int offset = h & 1;
+            // 定位到 table 中某个槽位后右移并进行位与运算得到最低的 4 位的值（0xfL 为二进制的 1111）
+            count[i] = (int) ((table[block + offset + (i << 1)] >>> (index << 2)) & 0xfL);
+        }
+        // 取其中的较小值
+        return Math.min(Math.min(count[0], count[1]), Math.min(count[2], count[3]));
+    }
+
+    public void increment(E e) {
+        if (isNotInitialized()) {
+            return;
+        }
+
+        // 长度为 8 的数组记录该元素对应的位置，每个计数器需要两个值来定位
+        int[] index = new int[8];
+        int blockHash = spread(e.hashCode());
+        int counterHash = rehash(blockHash);
+        int block = (blockHash & blockMask) << 3;
+        for (int i = 0; i < 4; i++) {
+            int h = counterHash >>> (i << 3);
+            // i 记录定位到 table 中某元素的位偏移量
+            index[i] = (h >>> 1) & 15;
+            int offset = h & 1;
+            // i + 4 记录元素所在 table 中的索引
+            index[i + 4] = block + offset + (i << 1);
+        }
+        // 四个对应的计数器都需要累加
+        boolean added =
+                incrementAt(index[4], index[0])
+                        | incrementAt(index[5], index[1])
+                        | incrementAt(index[6], index[2])
+                        | incrementAt(index[7], index[3]);
+
+        // 累加成功且达到采样大小需要进行重置
+        if (added && (++size == sampleSize)) {
+            reset();
+        }
+    }
+
+    boolean incrementAt(int i, int j) {
+        int offset = j << 2;
+        long mask = (0xfL << offset);
+        if ((table[i] & mask) != mask) {
+            table[i] += (1L << offset);
+            return true;
+        }
+        return false;
+    }
+
+    // 重置机制防止计数器溢出
+    void reset() {
+        int count = 0;
+        for (int i = 0; i < table.length; i++) {
+            // 累加 table 中每个元素的 2 进制表示的 1 的个数，结果为计数器个数的 4 倍
+            count += Long.bitCount(table[i] & ONE_MASK);
+            // 右移一位将计数值减半并将高位清零
+            table[i] = (table[i] >>> 1) & RESET_MASK;
+        }
+        // count >>> 2 表示计数器个数，计算重置后的 size
+        size = (size - (count >>> 2)) >>> 1;
+    }
+
+    static int spread(int x) {
+        x ^= x >>> 17;
+        x *= 0xed5ad4bb;
+        x ^= x >>> 11;
+        x *= 0xac4c1b51;
+        x ^= x >>> 15;
+        return x;
+    }
+
+    static int rehash(int x) {
+        x *= 0x31848bab;
+        x ^= x >>> 14;
+        return x;
+    }
+
 }
 ```
 
+到这里，`Caffeine` 缓存的基本数据结构全貌已经展现出来了，如下所示，在后文中我们再具体讲解它们之间是如何协同的。
+
+![caffeine.drawio.png](caffeine.drawio.png)
 
 ### put
 
@@ -1239,3 +1358,5 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 }
 ```
+
+- policy weight 的含义 与 policy 有关系吗？
