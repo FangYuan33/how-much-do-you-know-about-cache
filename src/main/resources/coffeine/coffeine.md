@@ -591,18 +591,18 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
     final Buffer<Node<K, V>> readBuffer;
 
     final Consumer<Node<K, V>> accessPolicy;
-    
+
     @GuardedBy("evictionLock")
     void drainReadBuffer() {
         if (!skipReadBuffer()) {
             readBuffer.drainTo(accessPolicy);
         }
     }
-    
+
 }
 ```
 
-它在这里会执行到 `BoundedBuffer#drainTo` 方法，并且入参了 `Consumer<Node<K, V>> accessPolicy` 
+它在这里会执行到 `BoundedBuffer#drainTo` 方法，并且入参了 `Consumer<Node<K, V>> accessPolicy`
 
 ```java
 final class BoundedBuffer<E> extends StripedBuffer<E> {
@@ -646,7 +646,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
     protected BoundedLocalCache(Caffeine<K, V> builder,
                                 @Nullable AsyncCacheLoader<K, V> cacheLoader, boolean isAsync) {
-        accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {};
+        accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {
+        };
     }
 
     @GuardedBy("evictionLock")
@@ -689,7 +690,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         // 检查试用区是否包含该节点，不包含则证明已经被移除，则不处理
         if (!accessOrderProbationDeque().contains(node)) {
             return;
-        } 
+        }
         // 检查节点的权重是否超过保护区最大值
         else if (node.getPolicyWeight() > mainProtectedMaximum()) {
             // 如果超过，将该节点移动到 试用区 尾巴节点，保证超重的节点不会被移动到保护区
@@ -721,10 +722,20 @@ Main Probation: 试用区
 
 Main Protected: 保护区
 
-那么，我们在这里假设，执行 `maintenance` 方法时其他处理写缓冲区方法等均无需特别处理，直接跳转到最后的 `climb`，看看它是如何为缓存“增值”的：
+那么，我们在这里假设，执行 `maintenance` 方法时其他处理写缓冲区方法等均无需特别处理，直接跳转到最后的 `climb`
+，看看它是如何为缓存“增值（climb）”的：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    static final double HILL_CLIMBER_RESTART_THRESHOLD = 0.05d;
+
+    static final double HILL_CLIMBER_STEP_PERCENT = 0.0625d;
+
+    // 步长值衰减比率
+    static final double HILL_CLIMBER_STEP_DECAY_RATE = 0.98d;
+
+    static final int QUEUE_TRANSFER_THRESHOLD = 1_000;
 
     @GuardedBy("evictionLock")
     void climb() {
@@ -732,10 +743,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             return;
         }
 
-        // 
+        // 确定要调整的量
         determineAdjustment();
+        // 将保护区中的元素降级到试用区
         demoteFromMainProtected();
+        // 获取第一步计算完毕的调整大小
         long amount = adjustment();
+        // 不调整则结束，否则根据正负增大或减小窗口大小
         if (amount == 0) {
             return;
         } else if (amount > 0) {
@@ -744,6 +758,183 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             decreaseWindow();
         }
     }
+
+    @GuardedBy("evictionLock")
+    void determineAdjustment() {
+        // 检查频率草图是否被初始化
+        if (frequencySketch().isNotInitialized()) {
+            // 没有被初始化则重置命中率、命中和未命中样本数
+            setPreviousSampleHitRate(0.0);
+            setMissesInSample(0);
+            setHitsInSample(0);
+            return;
+        }
+
+        // 请求总数 = 命中样本数 + 未命中样本数
+        int requestCount = hitsInSample() + missesInSample();
+        if (requestCount < frequencySketch().sampleSize) {
+            return;
+        }
+
+        // 计算命中率、命中率变化
+        double hitRate = (double) hitsInSample() / requestCount;
+        double hitRateChange = hitRate - previousSampleHitRate();
+        // 计算调整量，如果命中率增加获取正的步长值，否则获取负的步长值
+        double amount = (hitRateChange >= 0) ? stepSize() : -stepSize();
+        // 计算下一个步长值，如果变化量超过阈值，那么重新计算步长，否则按照固定衰减率计算
+        double nextStepSize = (Math.abs(hitRateChange) >= HILL_CLIMBER_RESTART_THRESHOLD)
+                ? HILL_CLIMBER_STEP_PERCENT * maximum() * (amount >= 0 ? 1 : -1)
+                : HILL_CLIMBER_STEP_DECAY_RATE * amount;
+        // 记录本次命中率作为下一次计算的依据
+        setPreviousSampleHitRate(hitRate);
+        // 记录要调整的量
+        setAdjustment((long) amount);
+        // 记录步长值
+        setStepSize(nextStepSize);
+        // 重置未命中和命中数量
+        setMissesInSample(0);
+        setHitsInSample(0);
+    }
+
+    @GuardedBy("evictionLock")
+    void demoteFromMainProtected() {
+        // 获取保护区的最大值和当前值
+        long mainProtectedMaximum = mainProtectedMaximum();
+        long mainProtectedWeightedSize = mainProtectedWeightedSize();
+        // 当前值没有超过最大值则不处理
+        if (mainProtectedWeightedSize <= mainProtectedMaximum) {
+            return;
+        }
+
+        // 每次从保护区转换到试用区有 1000 个最大限制
+        for (int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
+            // 一旦不超过最大阈值则停止
+            if (mainProtectedWeightedSize <= mainProtectedMaximum) {
+                break;
+            }
+
+            // 在保护区取出头节点
+            Node<K, V> demoted = accessOrderProtectedDeque().poll();
+            if (demoted == null) {
+                break;
+            }
+            // 标记为试用区
+            demoted.makeMainProbation();
+            // 加入到试用区中
+            accessOrderProbationDeque().offerLast(demoted);
+            // 计算保护区权重大小
+            mainProtectedWeightedSize -= demoted.getPolicyWeight();
+        }
+        // 更新保护区权重
+        setMainProtectedWeightedSize(mainProtectedWeightedSize);
+    }
+
+    @GuardedBy("evictionLock")
+    void increaseWindow() {
+        // 保护区最大容量为 0 则没有可调整的空间
+        if (mainProtectedMaximum() == 0) {
+            return;
+        }
+
+        // 窗口调整的变化量由保护区贡献，取能够变化额度 quota 为计算调整量和保护区最大值中的小值
+        long quota = Math.min(adjustment(), mainProtectedMaximum());
+        // 减小保护区大小增加窗口区大小
+        setMainProtectedMaximum(mainProtectedMaximum() - quota);
+        setWindowMaximum(windowMaximum() + quota);
+        // 保护区大小变动后，需要操作元素由保护区降级到试用区
+        demoteFromMainProtected();
+
+        for (int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
+            // 获取试用区头节点为“候选节点”
+            Node<K, V> candidate = accessOrderProbationDeque().peekFirst();
+            boolean probation = true;
+            // 如果在试用区获取失败或者窗口调整的变化量要比该节点所占的权重小，那么尝试从保护区获取节点
+            if ((candidate == null) || (quota < candidate.getPolicyWeight())) {
+                candidate = accessOrderProtectedDeque().peekFirst();
+                probation = false;
+            }
+            // 试用区和保护区均无节点，则无需处理，结束循环
+            if (candidate == null) {
+                break;
+            }
+
+            // 获取该候选节点的权重，如果可变化额度比候选权重小，那么无需处理
+            int weight = candidate.getPolicyWeight();
+            if (quota < weight) {
+                break;
+            }
+
+            // 每移除一个节点更新需要可变化额度
+            quota -= weight;
+            // 如果是试用区节点，则直接移除
+            if (probation) {
+                accessOrderProbationDeque().remove(candidate);
+            }
+            // 如果是保护区节点，需要更新保护区权重大小，再将其从保护区中移除
+            else {
+                setMainProtectedWeightedSize(mainProtectedWeightedSize() - weight);
+                accessOrderProtectedDeque().remove(candidate);
+            }
+            // 增加窗口区大小
+            setWindowWeightedSize(windowWeightedSize() + weight);
+            // 将被移除的“候选节点”添加到窗口区中
+            accessOrderWindowDeque().offerLast(candidate);
+            // 标记为窗口区节点
+            candidate.makeWindow();
+        }
+
+        // 可能存在 quota 小于 节点权重 的情况，那么这些量无法再调整，需要重新累加到保护区，并在窗口区中减掉
+        setMainProtectedMaximum(mainProtectedMaximum() + quota);
+        setWindowMaximum(windowMaximum() - quota);
+        // 将未完成调整的 quota 记录在调整值中
+        setAdjustment(quota);
+    }
     
+    @GuardedBy("evictionLock")
+    void decreaseWindow() {
+        // 如果窗口区大小小于等于 1 则无法再减少了
+        if (windowMaximum() <= 1) {
+            return;
+        }
+
+        // 获取变化量的额度（正整数），取调整值和窗口最大值减一中较小的值
+        long quota = Math.min(-adjustment(), Math.max(0, windowMaximum() - 1));
+        // 更新保护区和窗口区大小
+        setMainProtectedMaximum(mainProtectedMaximum() + quota);
+        setWindowMaximum(windowMaximum() - quota);
+
+        for (int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
+            // 从窗口区获取“候选节点”
+            Node<K, V> candidate = accessOrderWindowDeque().peekFirst();
+            // 未获取到说明窗口区已经没有元素了，不能再减小了，结束循环操作
+            if (candidate == null) {
+                break;
+            }
+
+            // 获取候选节点的权重
+            int weight = candidate.getPolicyWeight();
+            // 可变化的额度小于权重，则不支持变化，结束循环
+            if (quota < weight) {
+                break;
+            }
+
+            // 随着节点的移动，变更可变化额度
+            quota -= weight;
+            // 更新窗口区大小并将元素从窗口区移除
+            setWindowWeightedSize(windowWeightedSize() - weight);
+            accessOrderWindowDeque().remove(candidate);
+            // 将从窗口区中移除的元素添加到试用区
+            accessOrderProbationDeque().offerLast(candidate);
+            // 将节点标记为试用区元素
+            candidate.makeMainProbation();
+        }
+
+        // 此时 quote 为剩余无法变更的额度，需要在保护区中减去在窗口区中加上
+        setMainProtectedMaximum(mainProtectedMaximum() - quota);
+        setWindowMaximum(windowMaximum() + quota);
+        // 记录未变更完的额度在调整值中
+        setAdjustment(-quota);
+    }
+
 }
 ```
