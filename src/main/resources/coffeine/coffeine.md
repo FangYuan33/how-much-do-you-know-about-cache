@@ -550,6 +550,8 @@ final class FrequencySketch<E> {
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
 
+    static final int WRITE_BUFFER_RETRIES = 100;
+
     final MpscGrowableArrayQueue<Runnable> writeBuffer;
 
     final ConcurrentHashMap<Object, Node<K, V>> data;
@@ -589,7 +591,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                 prior = data.putIfAbsent(node.getKeyReference(), node);
                 // 返回 null 表示插入成功
                 if (prior == null) {
-                    // 该方法用于写操作后执行任务
+                    // 写操作后添加 AddTask 并调度执行任务
                     afterWrite(new AddTask(node, newWeight));
                     return null;
                 }
@@ -599,9 +601,17 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         }
         // ...
     }
+}
+```
 
-    // 添加 Task 到 writeBuffer 中并在合适的时机调度任务
+todo nodeFactory.newNode(
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    // 添加写后 Task 到 writeBuffer 中并在合适的时机调度执行任务
     void afterWrite(Runnable task) {
+        // 最多重试添加 100 次
         for (int i = 0; i < WRITE_BUFFER_RETRIES; i++) {
             if (writeBuffer.offer(task)) {
                 // 写后调度
@@ -681,16 +691,15 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-任务处理中状态时，其他线程是不能提交任务的
-
-接线来我们看一下要执行的任务 `PerformCleanupTask`
+在任务处理中状态时，会获取同步锁 `evictionLock` 表示任何时刻只能有一个线程提交任务，提交的任务为 `PerformCleanupTask`
+在上文中见到过，它用于执行 `maintenance` 方法，接下来我们看一下具体实现：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
 
     final ReentrantLock evictionLock;
 
-    // 可重用的维护任务，避免使用 ForkJoinPool 来包装
+    // 可重用的任务，用于执行 maintenance 方法，避免了使用 ForkJoinPool 来包装
     static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
         private static final long serialVersionUID = 1L;
 
@@ -716,13 +725,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         public void run() {
             BoundedLocalCache<?, ?> cache = reference.get();
             if (cache != null) {
-                cache.performCleanUp(/* ignored */ null);
+                cache.performCleanUp(null);
             }
         }
         // ...
     }
 
-    // 执行维护任务时，也获取了同步锁，表示维护任务只能由一个线程来完成
+    // 执行该任务时，也要获取同步锁，表示任务只能由一个线程来执行
     void performCleanUp(@Nullable Runnable task) {
         evictionLock.lock();
         try {
@@ -769,7 +778,34 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-本次我们先关注 `drainWriteBuffer` 处理写缓冲区中的任务，`put` 元素对应的任务为 `AddTask`
+因为目前关注的是 `put` 方法，所以重点先看 `drainWriteBuffer` 方法处理写缓冲区中的任务：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    static final int NCPU = Runtime.getRuntime().availableProcessors();
+
+    static final int WRITE_BUFFER_MAX = 128 * ceilingPowerOfTwo(NCPU);
+
+    final MpscGrowableArrayQueue<Runnable> writeBuffer;
+
+    @GuardedBy("evictionLock")
+    void drainWriteBuffer() {
+        // 最大循环次数为 writeBuffer 最大容量，直至弹出元素为 null
+        for (int i = 0; i <= WRITE_BUFFER_MAX; i++) {
+            Runnable task = writeBuffer.poll();
+            if (task == null) {
+                return;
+            }
+            task.run();
+        }
+        // 更新状态为 PROCESSING_TO_REQUIRED
+        setDrainStatusOpaque(PROCESSING_TO_REQUIRED);
+    }
+}
+```
+
+在上文中我们已经知道 `put` 方法添加的任务为 `AddTask`，下面我们看一下该任务的实现：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -778,6 +814,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
     final class AddTask implements Runnable {
         final Node<K, V> node;
+        // 节点权重
         final int weight;
 
         AddTask(Node<K, V> node, int weight) {
@@ -789,12 +826,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         @GuardedBy("evictionLock")
         @SuppressWarnings("FutureReturnValueIgnored")
         public void run() {
-            // 是否需要被驱逐
+            // 是否指定了驱逐策略
             if (evicts()) {
-                // 更新总权重和窗口权重
+                // 更新缓存权重大小和窗口权重
                 setWeightedSize(weightedSize() + weight);
                 setWindowWeightedSize(windowWeightedSize() + weight);
-                // 更新 policy 权重
+                // 更新节点 policyWeight
                 node.setPolicyWeight(node.getPolicyWeight() + weight);
 
                 // 检测当前总权重是否超过一半的最大容量
@@ -837,16 +874,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                 }
                 // 驱逐策略
                 if (evicts()) {
-                    // 如果权重比配置的权重大
+                    // 如果权重比配置的最大权重大
                     if (weight > maximum()) {
-                        // 驱逐策略
+                        // 执行驱逐策略
                         evictEntry(node, RemovalCause.SIZE, expirationTicker().read());
                     }
-                    // 如果权重超过窗口最大权重，放在头节点
+                    // 如果权重超过窗口区最大权重，则将其放在窗口区头节点
                     else if (weight > windowMaximum()) {
                         accessOrderWindowDeque().offerFirst(node);
                     }
-                    // 否则放在尾节点
+                    // 否则放在窗口区尾节点
                     else {
                         accessOrderWindowDeque().offerLast(node);
                     }
@@ -873,8 +910,11 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-在这个过程中我们简单了解了 `put` 添加缓存中不存在的元素的处理流程，需要知道元素是被直接添加到 `ConcurrentHashMap data`
-中的，至于其他驱逐、过期等维护操作是由任务异步驱动完成的，而且只能由单线程去处理，至于其中详细的逻辑在后文中介绍。
+todo evictEntry
+
+`put` 向缓存中添加不存在的元素时，
+
+元素被添加到 `ConcurrentHashMap data` 和窗口区（`WindowDeque`）中，根据节点权重大小区分是
 
 ### getIfPresent
 
