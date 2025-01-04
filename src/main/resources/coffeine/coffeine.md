@@ -662,11 +662,15 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 ```
 
 `writeBuffer` 的类型为 `MpscGrowableArrayQueue`，在这里我们详细的介绍下它。根据它的命名 **GrowableArrayQueue**
-可知它是一个容量可以增长的双端队列，前缀 **MPSC** 表达的含义是“多生产者，单消费者”，也就是说可以有多个线程能向其中添加元素，但只有一个线程能从其中获取元素。那么它是如何实现
-**MPSC** 的呢？首先我们先来看一下它的类继承关系图：
+可知它是一个容量可以增长的双端队列，前缀 **MPSC** 表达的含义是“多生产者，单消费者”，也就是说可以有多个线程能向其中添加元素，但只有一个线程能从其中获取元素。那么它是如何实现 **MPSC** 的呢？接下来我们就根据源码详细了解一下。
 
-`java.util.AbstractQueue` 就不再多解释了。首先我们先来看看命名类似的三个 `BaseMpscLinkedArrayQueuePad`
-类，它们三个类实现的内容均一致，所以我们以 `BaseMpscLinkedArrayQueuePad1` 为例来介绍：
+#### MpscGrowableArrayQueue
+
+首先我们先来看一下它的类继承关系图及简要说明：
+
+![WriteBuffer.drawio.png](WriteBuffer.drawio.png)
+
+图中灰色的表示抽象类，蓝色为实现类，`java.util.AbstractQueue` 就不再多解释了。首先我们先看看其中标记红框的内容：“避免内存伪共享问题”。以 `BaseMpscLinkedArrayQueuePad1` 为例：
 
 ```java
 abstract class BaseMpscLinkedArrayQueuePad1<E> extends AbstractQueue<E> {
@@ -688,17 +692,13 @@ abstract class BaseMpscLinkedArrayQueuePad1<E> extends AbstractQueue<E> {
 }
 ```
 
-这个类除了在类内定义了 120 字节的字段外，看上去没有做其他任何事情，实际上它为 **性能提升** 默默做出了贡献，**避免了内存伪共享问题
-**。CPU 中缓存行（Cache Line）的大小通常是 64 字节，定义了 120
-字节来占位，这样便能将上下继承关系间的字段间隔开，保证被多个线程访问的关键字段距离至少跨越一个缓存行，分布在不同的缓存行中。这样在不同的线程访问 `BaseMpscLinkedArrayQueueProducerFields`
-和 `BaseMpscLinkedArrayQueueConsumerFields`
-中字段时互不影响，详细了解原理可参考[博客园 - CPU Cache与缓存行](https://www.cnblogs.com/zhongqifeng/p/14765576.html)。
+这个类除了定义了 120 字节的字段外，看上去没有做其他任何事情，实际上它为 **性能提升** 默默做出了贡献，**避免了内存伪共享问题**。CPU 中缓存行（Cache Line）的大小通常是 64 字节，在类中定义 120 字节来占位，这样便能将上下继承关系间的字段间隔开，保证被多个线程访问的关键字段距离至少跨越一个缓存行，分布在不同的缓存行中。这样在不同的线程访问 `BaseMpscLinkedArrayQueueProducerFields` 和 `BaseMpscLinkedArrayQueueConsumerFields` 中字段时互不影响，详细了解原理可参考[博客园 - CPU Cache与缓存行](https://www.cnblogs.com/zhongqifeng/p/14765576.html)。
 
-`BaseMpscLinkedArrayQueueProducerFields` 定义生产者相关字段：
+接下来我们看看其他抽象类的作用。`BaseMpscLinkedArrayQueueProducerFields` 定义生产者相关字段：
 
 ```java
 abstract class BaseMpscLinkedArrayQueueProducerFields<E> extends BaseMpscLinkedArrayQueuePad1<E> {
-    // 生产者当前的索引
+    // 生产者操作索引（并不对应缓冲区 producerBuffer 中索引位置）
     protected long producerIndex;
 }
 ```
@@ -709,18 +709,18 @@ abstract class BaseMpscLinkedArrayQueueProducerFields<E> extends BaseMpscLinkedA
 abstract class BaseMpscLinkedArrayQueueConsumerFields<E> extends BaseMpscLinkedArrayQueuePad2<E> {
     // 掩码值，用于计算消费者实际的索引位置
     protected long consumerMask;
-    // 消费者访问这个缓存来获取元素消费
+    // 消费者访问这个缓冲区来获取元素消费
     protected E[] consumerBuffer;
-    // 消费者的索引值
+    // 消费者操作索引（并不对应缓冲区 consumerBuffer 中索引位置）
     protected long consumerIndex;
 }
 ```
 
-`BaseMpscLinkedArrayQueueColdProducerFields` 中定义字段如下，注意其中命名包含 **Cold**，表示其中字段被访问或修改的比较少：
+`BaseMpscLinkedArrayQueueColdProducerFields` 中定义字段如下，该类的命名包含 **Cold**，表示其中字段被修改的次数会比较少：
 
 ```java
 abstract class BaseMpscLinkedArrayQueueColdProducerFields<E> extends BaseMpscLinkedArrayQueuePad3<E> {
-    // 生产者可以生产的最大索引
+    // 生产者可以操作的最大索引上限
     protected volatile long producerLimit;
     // 掩码值，用于计算生产者在数组中实际的索引
     protected long producerMask;
@@ -777,11 +777,11 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
             throw new IllegalArgumentException("Initial capacity must be 2 or more");
         }
 
-        // 初始化缓存大小为数值最接近的 2 的 n 次幂
+        // 初始化缓冲区大小为数值最接近的 2 的 n 次幂
         int p2capacity = ceilingPowerOfTwo(initialCapacity);
-        // 掩码值，-1L 使其低位均为 1，左移 1 位则最低位为 0，eg: 00000110，注意该值会被生产者和消费者掩码值共同记录
+        // 掩码值，-1L 使其低位均为 1，左移 1 位则最低位为 0，eg: 00000110，注意该值会被生产者和消费者掩码值共同赋值
         long mask = (p2capacity - 1L) << 1;
-        // 创建一个大小为 2的n次幂 +1 大小的缓存，注意这个 buffer 分别被 producerBuffer 和 consumerBuffer 共同引用
+        // 创建一个大小为 2的n次幂 +1 大小的缓冲区，注意这个 buffer 分别被 producerBuffer 和 consumerBuffer 共同引用
         E[] buffer = allocate(p2capacity + 1);
         // BaseMpscLinkedArrayQueueColdProducerFields 类中相关字段赋值
         producerBuffer = buffer;
@@ -795,7 +795,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-向其中添加元素时，会调用 `BaseMpscLinkedArrayQueue#offer` 方法，它是实现 **MPSC** 的核心方法，如下：
+现在 `MpscGrowableArrayQueue` 的构建已经看完了，了解了其中关键字段的赋值，现在我们就需要看它是如何实现 **MPSC** 的。“多生产者”也就意味着会有多个线程向其中添加元素，添加操作对应了 `BaseMpscLinkedArrayQueue#offer` 方法，它的实现如下，在看源码的过程中，需要思考它是如何在多线程间完成协同的：
 
 ```java
 abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
@@ -818,16 +818,15 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
             long producerLimit = lvProducerLimit();
             // 生产者当前索引，初始值为 0，BaseMpscLinkedArrayQueueProducerFields 中字段 
             pIndex = lvProducerIndex(this);
-            // 低位为 1 表示正在扩容，自旋直到扩容完成（表示只有一个线程操作扩容）
+            // producerIndex 最低位用来表示扩容（索引生产者索引 producerIndex 并不对应缓冲区中实际的索引）
+            // 低位为 1 表示正在扩容，自旋等待直到扩容完成（表示只有一个线程操作扩容）
             if ((pIndex & 1) == 1) {
                 continue;
             }
-            // producerIndex 最低位用来表示扩容，右移一位表示实际的索引值
 
-            // 掩码值和buffer可能在扩容中被改变，每次循环使用扩容完成之后 CAS 操作完成的最新值
+            // 掩码值和buffer可能在扩容中被改变，每次循环使用最新值
             mask = this.producerMask;
             buffer = this.producerBuffer;
-            // a successful CAS ties the ordering, lv(pIndex)-[mask/buffer]->cas(pIndex)
 
             // 检查是否需要扩容
             if (producerLimit <= pIndex) {
@@ -845,26 +844,25 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
                 }
             }
 
-            // CAS 操作更新生产者索引，注意这里是 +2，这也正对应了注释中描述的：右移一位表示实际索引
-            // 更新成功结束循环
+            // CAS 操作更新生产者索引，注意这里是 +2，更新成功结束循环
             if (casProducerIndex(this, pIndex, pIndex + 2)) {
                 break;
             }
         }
-        // 计算该元素在 buffer 中的实际偏移量，并将其封装在 Buffer 中
+        // 计算该元素在 buffer 中的实际偏移量，并将其添加到缓冲区中
         final long offset = modifiedCalcElementOffset(pIndex, mask);
         soElement(buffer, offset, e);
         return true;
     }
 
-    // 没有将 resize 逻辑封装在该方法中，而是由该方法判断是否需要扩容，因为不会在扩容时添加元素
+    // 没有将 resize 逻辑封装在该方法中，而是由该方法判断是否需要扩容
     private int offerSlowPath(long mask, long pIndex, long producerLimit) {
         int result;
         // 获取消费者索引 BaseMpscLinkedArrayQueueConsumerFields 类中
         final long cIndex = lvConsumerIndex(this);
         // 通过掩码值计算当前缓冲区容量
         long bufferCapacity = getCurrentBufferCapacity(mask);
-        result = 0;// 0 - goto pIndex CAS
+        result = 0;
         // 如果队列还有空间
         if (cIndex + bufferCapacity > pIndex) {
             // 尝试更新生产者最大限制，更新失败则返回 1 重试
@@ -916,21 +914,23 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         soProducerLimit(this, pIndex + Math.min(newMask, availableInQueue));
         soProducerIndex(this, pIndex + 2);
 
-        // 将旧缓存中该位置的元素更新为 JUMP 标志位，这样在被消费时就知道去新的缓冲区获取了
+        // 将旧缓冲区中该位置的元素更新为 JUMP 标志位，这样在被消费时就知道去新的缓冲区获取了
         soElement(oldBuffer, offsetInOld, JUMP);
     }
-
-    static long modifiedCalcElementOffset(long index, long mask) {
-        return (index & mask) >> 1;
-    }
-
+    
     private long nextArrayOffset(final long mask) {
         return modifiedCalcElementOffset(mask + 2, Long.MAX_VALUE);
+    }
+    
+    // 因为最低位用来表示是否在扩容，所以 producerIndex 和 consumerIndex 并不表示实际的索引
+    // 注意生产者（消费者）操作索引值会随着元素的增加不断变大，因为有它们和掩码值的位与运算才保证了索引值一直在索引值的有效范围内
+    static long modifiedCalcElementOffset(long index, long mask) {
+        return (index & mask) >> 1;
     }
 }
 ```
 
-可见，在这个过程中它并没有限制操作线程数量，通过使用 **CAS 操作** 和 **可见性** 保证多线程同时添加元素的协同，如下：
+可见，在这个过程中它并没有限制操作线程数量，并通过保证 **可见性** 和使用 **CAS 操作** 允许多线程同时添加元素，可见性保证和CAS操作源码如下：
 
 ```java
 abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
@@ -950,7 +950,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-可见性（内存操作对其他线程可见）是通过 **内存屏障** 来保证的，除此之外，内存屏障还能够 **防止重排序**（确保在内存屏障前后的内存操作不会被重排序，从而保证程序的正确性）。接下来我们需要继续看一下 `BaseMpscLinkedArrayQueue#poll` 方法：
+保证可见性（内存操作对其他线程可见）的原理是 **内存屏障**，除了保证可见性以外，内存屏障还能够 **防止重排序**（确保在内存屏障前后的内存操作不会被重排序，从而保证程序的正确性）。到这里，生产者添加元素的逻辑我们已经分析完了，接下来我们需要继续看一下消费者取出元素的逻辑，它对应了  `BaseMpscLinkedArrayQueue#poll` 方法，同样地，在这过程中需要关注“在这个方法中有没有限制单一线程执行”：
 
 ```java
 abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
@@ -984,23 +984,23 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         if (e == JUMP) {
             // 获取到新缓冲区
             final E[] nextBuffer = getNextBuffer(buffer, mask);
-            // 
+            // 在新缓冲区中获取到对应元素
             return newBufferPoll(nextBuffer, index);
         }
         // 清除当前索引的元素，表示该元素已经被消费
         soElement(buffer, offset, null);
-        // 更新消费者索引，这里也是 +2，所以和生产者索引一样，实际的索引在 modifiedCalcElementOffset 方法中计算完后需要右移 1 位
+        // 更新消费者索引，这里也是 +2，它并不表示实际的在缓冲区的索引
         soConsumerIndex(this, index + 2);
         return (E) e;
     }
 
     private E[] getNextBuffer(final E[] buffer, final long mask) {
         // 如果已经发生扩容，此时 consumerMask 仍然对应的是扩容前的 mask
-        // 所以此处与生产者操作扩容时拼接新旧缓冲区调用的是一样的方法，这样便能够获取到新缓冲区的偏移量
+        // 此处与生产者操作扩容时拼接新旧缓冲区调用的是一样的方法，这样便能够获取到新缓冲区的偏移量
         final long nextArrayOffset = nextArrayOffset(mask);
-        // 获取到新缓冲区
+        // 获取到新缓冲区，因为在扩容操作时已经将新缓冲区链接到旧缓冲区上了
         final E[] nextBuffer = (E[]) lvElement(buffer, nextArrayOffset);
-        // 将旧缓冲区中新缓冲区位置设置为 null 表示已经处理过
+        // 将旧缓冲区中新缓冲区位置设置为 null 表示旧缓冲区中已经没有任何元素需要被消费了，也不再需要被引用了（能被垃圾回收了）
         soElement(buffer, nextArrayOffset, null);
         return nextBuffer;
     }
@@ -1010,7 +1010,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
     }
 
     private E newBufferPoll(E[] nextBuffer, final long index) {
-        // 计算出消费者索引在新缓存中的实际位置
+        // 计算出消费者操作索引在新缓冲区中对应的实际位置
         final long offsetInNew = newBufferAndOffset(nextBuffer, index);
         // 在新缓冲区中获取到对应元素
         final E n = lvElement(nextBuffer, offsetInNew);
@@ -1041,14 +1041,18 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-可以发现在该方法中并没有做多线程间的同步，所以理论上这个方法可能被多个线程调用，那么它又为什么被称为 **MPSC** 呢？在这个方法的注释中有一段话值得细心体会：
+可以发现在该方法中并没有限制单一线程执行，所以理论上这个方法可能被多个线程调用，那么它又为什么被称为 **MPSC** 呢？在这个方法的注释中有一段话值得细心体会：
 
 > This implementation is correct for single consumer thread use only.
 > 此实现仅适用于单消费者线程使用
 
 所以，猜想调用该方法的一定是一个线程数大小固定为1的线程池，保证单线程调用，至于是不是如此，需要等到在后续的源码中验证了。
 
-到这里 `MpscGrowableArrayQueue` 中核心的逻辑已经讲解完了，现在我们回过头来再看一下队列扩容前后生产者和消费者是如何协同的？在扩容前，`consumerBuffer` 和 `producerBuffer` 引用的是同一个缓冲区对象。如果发生扩容，那么生产者会创建一个新的缓冲区，并将 `producerBuffer` 引用指向它，此时它做了一个 **非常巧妙** 的操作，将 **新缓冲区依然链接到旧缓冲区** 上，并将触发扩容的元素对应的旧缓冲区的索引处标记为 JUMP，表示这及之后的元素已经都在新缓冲区中。此时，消费者依然会在旧缓冲区中慢慢地消费，直到遇到 JUMP 标志位，消费者就知道需要到新缓冲区中取获取元素了。因为之前生产者在扩容时对新旧缓冲区进行链接，所以消费者能够获取到新缓冲区的引用，并变更 `consumerBuffer` 的引用和 `consumerMask` 掩码值，接下来的过程便和扩容前没有差别了。
+到这里 `MpscGrowableArrayQueue` 中核心的逻辑已经讲解完了，现在我们回过头来再看一下队列扩容前后生产者和消费者是如何协同的？在扩容前，`consumerBuffer` 和 `producerBuffer` 引用的是同一个缓冲区对象。如果发生扩容，那么生产者会创建一个新的缓冲区，并将 `producerBuffer` 引用指向它，此时它做了一个 **非常巧妙** 的操作，将 **新缓冲区依然链接到旧缓冲区** 上，并将触发扩容的元素对应的旧缓冲区的索引处标记为 JUMP，表示这及之后的元素已经都在新缓冲区中。此时，消费者依然会在旧缓冲区中慢慢地消费，直到遇到 JUMP 标志位，消费者就知道需要到新缓冲区中取获取元素了。因为之前生产者在扩容时对新旧缓冲区进行链接，所以消费者能够通过旧缓冲区获取到新缓冲区的引用，并变更 `consumerBuffer` 的引用和 `consumerMask` 掩码值，接下来的消费过程便和扩容前没有差别了。
+
+#### scheduleDrainBuffers 方法
+
+现在我们再回到 `put` 方法的逻辑中，继续看 `scheduleDrainBuffers` 方法，调度任务的执行：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
