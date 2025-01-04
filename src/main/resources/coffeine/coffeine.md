@@ -779,9 +779,9 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 
         // 初始化缓存大小为数值最接近的 2 的 n 次幂
         int p2capacity = ceilingPowerOfTwo(initialCapacity);
-        // 掩码值，-1L 使其低位均为 1，左移 1 位则最低位为 0，eg: 00000110
+        // 掩码值，-1L 使其低位均为 1，左移 1 位则最低位为 0，eg: 00000110，注意该值会被生产者和消费者掩码值共同记录
         long mask = (p2capacity - 1L) << 1;
-        // 创建一个大小为 2的n次幂 +1 大小的缓存
+        // 创建一个大小为 2的n次幂 +1 大小的缓存，注意这个 buffer 分别被 producerBuffer 和 consumerBuffer 共同引用
         E[] buffer = allocate(p2capacity + 1);
         // BaseMpscLinkedArrayQueueColdProducerFields 类中相关字段赋值
         producerBuffer = buffer;
@@ -903,7 +903,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         // 将元素放到新缓冲区中
         soElement(newBuffer, offsetInNew, e);
         // 将新缓冲区连接到旧缓冲区中
-        soElement(oldBuffer, nextArrayOffset(oldMask), newBuffer);// buffer linked
+        soElement(oldBuffer, nextArrayOffset(oldMask), newBuffer);
 
         // 校验可用空间
         final long cIndex = lvConsumerIndex(this);
@@ -918,6 +918,14 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 
         // 将旧缓存中该位置的元素更新为 JUMP 标志位，这样在被消费时就知道去新的缓冲区获取了
         soElement(oldBuffer, offsetInOld, JUMP);
+    }
+
+    static long modifiedCalcElementOffset(long index, long mask) {
+        return (index & mask) >> 1;
+    }
+
+    private long nextArrayOffset(final long mask) {
+        return modifiedCalcElementOffset(mask + 2, Long.MAX_VALUE);
     }
 }
 ```
@@ -942,7 +950,105 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-可见性（内存操作对其他线程可见）是通过 **内存屏障** 来保证的，除此之外，内存屏障还能够 **防止重排序**（确保在内存屏障前后的内存操作不会被重排序，从而保证程序的正确性）。
+可见性（内存操作对其他线程可见）是通过 **内存屏障** 来保证的，除此之外，内存屏障还能够 **防止重排序**（确保在内存屏障前后的内存操作不会被重排序，从而保证程序的正确性）。接下来我们需要继续看一下 `BaseMpscLinkedArrayQueue#poll` 方法：
+
+```java
+abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
+    
+    private static final Object JUMP = new Object();
+    
+    public E poll() {
+        // 读取消费者相关字段 BaseMpscLinkedArrayQueueConsumerFields 类
+        final E[] buffer = consumerBuffer;
+        final long index = consumerIndex;
+        final long mask = consumerMask;
+
+        // 根据消费索引，计算出元素在消费者缓冲区中实际的位置
+        final long offset = modifiedCalcElementOffset(index, mask);
+        // 读取该元素（volatile 可见性读取）
+        Object e = lvElement(buffer, offset);
+        
+        // 如果为空
+        if (e == null) {
+            // 比较生产者索引，如果两个索引不相等，那么证明两索引间存在距离表示还有元素能够被消费
+            if (index != lvProducerIndex(this)) {
+                // 自旋读取元素，直到读到元素
+                do {
+                    e = lvElement(buffer, offset);
+                } while (e == null);
+            } else {
+                // 索引相等证明确实是空队列
+                return null;
+            }
+        }
+        if (e == JUMP) {
+            // 获取到新缓冲区
+            final E[] nextBuffer = getNextBuffer(buffer, mask);
+            // 
+            return newBufferPoll(nextBuffer, index);
+        }
+        // 清除当前索引的元素，表示该元素已经被消费
+        soElement(buffer, offset, null);
+        // 更新消费者索引，这里也是 +2，所以和生产者索引一样，实际的索引在 modifiedCalcElementOffset 方法中计算完后需要右移 1 位
+        soConsumerIndex(this, index + 2);
+        return (E) e;
+    }
+
+    private E[] getNextBuffer(final E[] buffer, final long mask) {
+        // 如果已经发生扩容，此时 consumerMask 仍然对应的是扩容前的 mask
+        // 所以此处与生产者操作扩容时拼接新旧缓冲区调用的是一样的方法，这样便能够获取到新缓冲区的偏移量
+        final long nextArrayOffset = nextArrayOffset(mask);
+        // 获取到新缓冲区
+        final E[] nextBuffer = (E[]) lvElement(buffer, nextArrayOffset);
+        // 将旧缓冲区中新缓冲区位置设置为 null 表示已经处理过
+        soElement(buffer, nextArrayOffset, null);
+        return nextBuffer;
+    }
+
+    private long nextArrayOffset(final long mask) {
+        return modifiedCalcElementOffset(mask + 2, Long.MAX_VALUE);
+    }
+
+    private E newBufferPoll(E[] nextBuffer, final long index) {
+        // 计算出消费者索引在新缓存中的实际位置
+        final long offsetInNew = newBufferAndOffset(nextBuffer, index);
+        // 在新缓冲区中获取到对应元素
+        final E n = lvElement(nextBuffer, offsetInNew);
+        if (n == null) {
+            throw new IllegalStateException("new buffer must have at least one element");
+        }
+        // 清除当前索引的元素，表示该元素已经被消费
+        soElement(nextBuffer, offsetInNew, null);
+        // 更新消费者索引
+        soConsumerIndex(this, index + 2);
+        return n;
+    }
+
+    private long newBufferAndOffset(E[] nextBuffer, final long index) {
+        // 将消费者缓冲区引用和掩码值更新
+        consumerBuffer = nextBuffer;
+        consumerMask = (nextBuffer.length - 2L) << 1;
+        return modifiedCalcElementOffset(index, consumerMask);
+    }
+    
+    static long modifiedCalcElementOffset(long index, long mask) {
+        return (index & mask) >> 1;
+    }
+    
+    static <E> E lvElement(E[] buffer, long offset) {
+        return (E) REF_ARRAY.getVolatile(buffer, (int) offset);
+    }
+}
+```
+
+可以发现在该方法中并没有做多线程间的同步，所以理论上这个方法可能被多个线程调用，那么它又为什么被称为 **MPSC** 呢？在这个方法的注释中有一段话值得细心体会：
+
+> This implementation is correct for single consumer thread use only.
+> 此实现仅适用于单消费者线程使用
+
+所以，猜想调用该方法的一定是一个线程数大小固定为1的线程池，保证单线程调用，至于是不是如此，需要等到在后续的源码中验证了。
+
+到这里 `MpscGrowableArrayQueue` 中核心的逻辑已经讲解完了，现在我们回过头来再看一下队列扩容前后生产者和消费者是如何协同的？在扩容前，`consumerBuffer` 和 `producerBuffer` 引用的是同一个缓冲区对象。如果发生扩容，那么生产者会创建一个新的缓冲区，并将 `producerBuffer` 引用指向它，此时它做了一个 **非常巧妙** 的操作，将 **新缓冲区依然链接到旧缓冲区** 上，并将触发扩容的元素对应的旧缓冲区的索引处标记为 JUMP，表示这及之后的元素已经都在新缓冲区中。此时，消费者依然会在旧缓冲区中慢慢地消费，直到遇到 JUMP 标志位，消费者就知道需要到新缓冲区中取获取元素了。因为之前生产者在扩容时对新旧缓冲区进行链接，所以消费者能够获取到新缓冲区的引用，并变更 `consumerBuffer` 的引用和 `consumerMask` 掩码值，接下来的过程便和扩容前没有差别了。
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
