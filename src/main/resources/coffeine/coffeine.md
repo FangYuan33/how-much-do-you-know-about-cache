@@ -748,7 +748,7 @@ abstract class MpscChunkedArrayQueue<E> extends MpscChunkedArrayQueueColdProduce
         // 调用父类的构造方法
         super(initialCapacity, maxCapacity);
     }
-    
+
 }
 
 abstract class MpscChunkedArrayQueueColdProducerFields<E> extends BaseMpscLinkedArrayQueue<E> {
@@ -801,7 +801,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
 
     private static final Object JUMP = new Object();
-    
+
     @Override
     @SuppressWarnings("MissingDefault")
     public boolean offer(final E e) {
@@ -818,17 +818,17 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
             long producerLimit = lvProducerLimit();
             // 生产者当前索引，初始值为 0，BaseMpscLinkedArrayQueueProducerFields 中字段 
             pIndex = lvProducerIndex(this);
-            // 低位为 1 表示正在扩容，自旋直到扩容完成
+            // 低位为 1 表示正在扩容，自旋直到扩容完成（表示只有一个线程操作扩容）
             if ((pIndex & 1) == 1) {
                 continue;
             }
             // producerIndex 最低位用来表示扩容，右移一位表示实际的索引值
-            
+
             // 掩码值和buffer可能在扩容中被改变，每次循环使用扩容完成之后 CAS 操作完成的最新值
             mask = this.producerMask;
             buffer = this.producerBuffer;
             // a successful CAS ties the ordering, lv(pIndex)-[mask/buffer]->cas(pIndex)
-            
+
             // 检查是否需要扩容
             if (producerLimit <= pIndex) {
                 int result = offerSlowPath(mask, pIndex, producerLimit);
@@ -856,7 +856,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         soElement(buffer, offset, e);
         return true;
     }
-    
+
     // 没有将 resize 逻辑封装在该方法中，而是由该方法判断是否需要扩容，因为不会在扩容时添加元素
     private int offerSlowPath(long mask, long pIndex, long producerLimit) {
         int result;
@@ -921,6 +921,28 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
     }
 }
 ```
+
+可见，在这个过程中它并没有限制操作线程数量，通过使用 **CAS 操作** 和 **可见性** 保证多线程同时添加元素的协同，如下：
+
+```java
+abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
+
+    static final VarHandle P_INDEX = pIndexLookup.findVarHandle(
+            BaseMpscLinkedArrayQueueProducerFields.class, "producerIndex", long.class);
+    
+    // volatile 可见性保证
+    static long lvProducerIndex(BaseMpscLinkedArrayQueue<?> self) {
+        return (long) P_INDEX.getVolatile(self);
+    }
+    
+    // CAS 操作
+    static boolean casProducerIndex(BaseMpscLinkedArrayQueue<?> self, long expect, long newValue) {
+        return P_INDEX.compareAndSet(self, expect, newValue);
+    }
+}
+```
+
+可见性（内存操作对其他线程可见）是通过 **内存屏障** 来保证的，除此之外，内存屏障还能够 **防止重排序**（确保在内存屏障前后的内存操作不会被重排序，从而保证程序的正确性）。
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
