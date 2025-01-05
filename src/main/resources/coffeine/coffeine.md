@@ -398,9 +398,7 @@ interface NodeFactory<K, V> {
 }
 ```
 
-`SSMS` 类型缓存对应的节点类型为 `PSMS`。
-
-除此之外我们还需要具体介绍下 `FrequencySketch`，它在上述方法的步骤 3 中被创建。这个类使用 **Count-Min Sketch**
+`SSMS` 类型缓存对应的节点类型为 `PSMS`。除此之外我们还需要具体介绍下 `FrequencySketch`，它在上述方法的步骤 3 中被创建。这个类使用 **Count-Min Sketch**
 算法计算某个元素的访问频率。它维护了一个 `long[] table` 一维数组，每个元素有 64 位，每 4 位作为一个计数器（这也就限定了最大频率为
 15），那么数组中每个槽位便是 16 个计数器。通过哈希函数取 4 个独立的计数值，将其中的最小值作为元素的访问频率。`table`
 的初始大小为缓存最大容量最接近的 2 的 n 次幂，并在计算哈希值时使用 `blockMask` 掩码来使哈希结果均匀分布，保证了获取元素访问频率的正确率为
@@ -580,7 +578,6 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
     final MpscGrowableArrayQueue<Runnable> writeBuffer;
 
     final ConcurrentHashMap<Object, Node<K, V>> data;
-    final PerformCleanupTask drainBuffersTask;
 
     final ReentrantLock evictionLock;
 
@@ -1050,13 +1047,20 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 
 到这里 `MpscGrowableArrayQueue` 中核心的逻辑已经讲解完了，现在我们回过头来再看一下队列扩容前后生产者和消费者是如何协同的？在扩容前，`consumerBuffer` 和 `producerBuffer` 引用的是同一个缓冲区对象。如果发生扩容，那么生产者会创建一个新的缓冲区，并将 `producerBuffer` 引用指向它，此时它做了一个 **非常巧妙** 的操作，将 **新缓冲区依然链接到旧缓冲区** 上，并将触发扩容的元素对应的旧缓冲区的索引处标记为 JUMP，表示这及之后的元素已经都在新缓冲区中。此时，消费者依然会在旧缓冲区中慢慢地消费，直到遇到 JUMP 标志位，消费者就知道需要到新缓冲区中取获取元素了。因为之前生产者在扩容时对新旧缓冲区进行链接，所以消费者能够通过旧缓冲区获取到新缓冲区的引用，并变更 `consumerBuffer` 的引用和 `consumerMask` 掩码值，接下来的消费过程便和扩容前没有差别了。
 
-#### scheduleDrainBuffers 方法
+#### scheduleAfterWrite 方法
 
-现在我们再回到 `put` 方法的逻辑中，继续看 `scheduleDrainBuffers` 方法，调度任务的执行：
+现在我们再回到 `put` 方法的逻辑中，如果向 `WriterBuffer` 中添加元素成功，则会调用 `scheduleAfterWrite` 方法，调度任务的执行：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
 
+    final ReentrantLock evictionLock = new ReentrantLock();
+    // 默认为 ForkJoinPool.commonPool()
+    final Executor executor;
+    // 该任务在创建缓存时已经完成初始化
+    final PerformCleanupTask drainBuffersTask;
+    
+    // 根据状态的变化来调度执行任务
     void scheduleAfterWrite() {
         // 获取当前 drainStatus，drain 译为排空，耗尽
         int drainStatus = drainStatusOpaque();
@@ -1092,13 +1096,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         }
     }
 
-    // 调度处理 drainBuffersTask
+    // 调度执行缓冲区中的任务
     void scheduleDrainBuffers() {
         // 如果状态表示正在有任务处理则返回
         if (drainStatusOpaque() >= PROCESSING_TO_IDLE) {
             return;
         }
-        // 注意这里获取了同步锁 evictionLock
+        // 注意这里要获取同步锁 evictionLock
         if (evictionLock.tryLock()) {
             try {
                 // 获取锁后再次校验当前处理状态
@@ -1122,13 +1126,10 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-在任务处理中状态时，会获取同步锁 `evictionLock` 表示任何时刻只能有一个线程提交任务，提交的任务为 `PerformCleanupTask`
-在上文中见到过，它用于执行 `maintenance` 方法，接下来我们看一下具体实现：
+写后调度处理任务（`scheduleAfterWrite`）会根据状态选择性执行 `scheduleDrainBuffers` 方法，执行该方法时通过同步锁 `evictionLock` 保证同时只有一个线程能提交 `PerformCleanupTask` 任务。这个任务在创建缓存时已经被初始化完成了，每次提交任务都会被复用，接下来我们看一下这个任务的具体实现：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
-
-    final ReentrantLock evictionLock;
 
     // 可重用的任务，用于执行 maintenance 方法，避免了使用 ForkJoinPool 来包装
     static final class PerformCleanupTask extends ForkJoinTask<Void> implements Runnable {
@@ -1154,6 +1155,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
         @Override
         public void run() {
+            // 获取到缓存对象
             BoundedLocalCache<?, ?> cache = reference.get();
             if (cache != null) {
                 cache.performCleanUp(null);
@@ -1161,7 +1163,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         }
         // ...
     }
+}
+```
 
+它的实现非常简单，其中 `reference` 字段在调用构造方法时被赋值，引用的是缓存对象本身。当任务被执行时，调用的是 `BoundedLocalCache#performCleanUp` 方法：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    final ReentrantLock evictionLock = new ReentrantLock();
+    
     // 执行该任务时，也要获取同步锁，表示任务只能由一个线程来执行
     void performCleanUp(@Nullable Runnable task) {
         evictionLock.lock();
@@ -1209,7 +1220,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-因为目前关注的是 `put` 方法，所以重点先看 `drainWriteBuffer` 方法处理写缓冲区中的任务：
+注意在执行 `performCleanUp` 方法时，也需要获取到同步锁 `evictionLock`，那么任务的提交和任务的执行也是互斥的。这个执行的核心逻辑在 `maintenance` “维护”方法中，注意这个方法被标记了注解 `@GuardedBy("evictionLock")`，源码中还有多个方法也标记了该注解，执行这些方法时都要获取同步锁，这也是在提醒我们这些方法同时只有由一条线程被执行。因为目前关注的是 `put` 方法，所以重点先看维护方法中 `drainWriteBuffer` 方法处理写缓冲区中的任务：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -1236,7 +1247,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-在上文中我们已经知道 `put` 方法添加的任务为 `AddTask`，下面我们看一下该任务的实现：
+执行逻辑非常简单，在获取到同步锁之后，在 `WriteBuffer` 中获取要被执行的任务并执行。上文中我们猜想“单消费者”的实现是由固定大小为 1 的线程池来保证的，但实际上使用的是 **同步锁的机制保证同时只能有一个消费者消费缓冲区中的任务**。
+
+在上文中我们已经知道，调用 `put` 方法时向缓冲区 `WriteBuffer` 中添加的任务为 `AddTask`，下面我们看一下该任务的实现：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -1259,10 +1272,11 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         public void run() {
             // 是否指定了驱逐策略
             if (evicts()) {
-                // 更新缓存权重大小和窗口权重
+                // 更新缓存权重和窗口区权重
                 setWeightedSize(weightedSize() + weight);
                 setWindowWeightedSize(windowWeightedSize() + weight);
-                // 更新节点 policyWeight
+                // 更新节点的 policyWeight，该字段只有在自定了权重计算规则时才有效
+                // 否则像只定义了固定容量的驱逐策略，使用默认元素权重为 1 是不需要关注该字段的
                 node.setPolicyWeight(node.getPolicyWeight() + weight);
 
                 // 检测当前总权重是否超过一半的最大容量
@@ -1273,7 +1287,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                         // 执行驱逐操作
                         evictEntries();
                     } else {
-                        // 延迟加载 frequencySketch 数据结构，用于统计元素访问频率
+                        // 延迟加载频率草图 frequencySketch 数据结构，用于统计元素访问频率
                         long capacity = isWeighted() ? data.mappingCount() : maximum;
                         frequencySketch().ensureCapacity(capacity);
                     }
@@ -1282,6 +1296,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                 // 更新频率统计信息
                 K key = node.getKey();
                 if (key != null) {
+                    // 因为频率草图数据结构具有延迟加载机制（权重超过半数）
+                    // 所以实际上在元素权重还未过半未完成初始化时，调用 increment 是没有作用的
                     frequencySketch().increment(key);
                 }
 
@@ -1307,7 +1323,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                 if (evicts()) {
                     // 如果权重比配置的最大权重大
                     if (weight > maximum()) {
-                        // 执行驱逐策略
+                        // 执行固定权重（RemovalCause.SIZE）的驱逐策略
                         evictEntry(node, RemovalCause.SIZE, expirationTicker().read());
                     }
                     // 如果权重超过窗口区最大权重，则将其放在窗口区头节点
@@ -1341,11 +1357,131 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-todo evictEntry
+根据注释很容易理解该方法的作用，因为我们目前对缓存只定义了固定容量的驱逐策略，所以我们需要在看一下 `evictEntry` 方法：
 
-`put` 向缓存中添加不存在的元素时，
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
 
-元素被添加到 `ConcurrentHashMap data` 和窗口区（`WindowDeque`）中，根据节点权重大小区分是
+    final ConcurrentHashMap<Object, Node<K, V>> data;
+    
+    @GuardedBy("evictionLock")
+    @SuppressWarnings({"GuardedByChecker", "NullAway", "PMD.CollapsibleIfStatements"})
+    boolean evictEntry(Node<K, V> node, RemovalCause cause, long now) {
+        K key = node.getKey();
+        @SuppressWarnings("unchecked")
+        V[] value = (V[]) new Object[1];
+        boolean[] removed = new boolean[1];
+        boolean[] resurrect = new boolean[1];
+        Object keyReference = node.getKeyReference();
+        RemovalCause[] actualCause = new RemovalCause[1];
+
+        data.computeIfPresent(keyReference, (k, n) -> {
+            if (n != node) {
+                return n;
+            }
+            synchronized (n) {
+                value[0] = n.getValue();
+
+                // key 或 value 为 null，这种情况下可能使用了 Caffeine.weakKeys, Caffeine.weakValues, or Caffeine.softValues
+                // 导致被垃圾回收了
+                if ((key == null) || (value[0] == null)) {
+                    // 标记实际失效原因为垃圾回收 
+                    actualCause[0] = RemovalCause.COLLECTED;
+                }
+                // 如果原因为垃圾回收，记录 resurrect 复活标记为 true
+                else if (cause == RemovalCause.COLLECTED) {
+                    resurrect[0] = true;
+                    return n;
+                }
+                // 否则记录入参中的原因
+                else {
+                    actualCause[0] = cause;
+                }
+
+                // 过期驱逐策略判断
+                if (actualCause[0] == RemovalCause.EXPIRED) {
+                    boolean expired = false;
+                    if (expiresAfterAccess()) {
+                        expired |= ((now - n.getAccessTime()) >= expiresAfterAccessNanos());
+                    }
+                    if (expiresAfterWrite()) {
+                        expired |= ((now - n.getWriteTime()) >= expiresAfterWriteNanos());
+                    }
+                    if (expiresVariable()) {
+                        expired |= (n.getVariableTime() <= now);
+                    }
+                    if (!expired) {
+                        resurrect[0] = true;
+                        return n;
+                    }
+                }
+                // 固定容量驱逐策略
+                else if (actualCause[0] == RemovalCause.SIZE) {
+                    int weight = node.getWeight();
+                    if (weight == 0) {
+                        resurrect[0] = true;
+                        return n;
+                    }
+                }
+
+                // 通知驱逐策略监听器，调用它的方法
+                notifyEviction(key, value[0], actualCause[0]);
+                // 将该 key 对应的刷新策略失效
+                discardRefresh(keyReference);
+                // 标记该节点被驱逐
+                removed[0] = true;
+                // 退休准备被垃圾回收
+                node.retire();
+            }
+            return null;
+        });
+
+        // 如果复活标记为 true 那么不被移除
+        if (resurrect[0]) {
+            return false;
+        }
+
+        // 节点已经要被驱逐
+        // 如果在窗口区，那么直接从窗口区移除
+        if (node.inWindow() && (evicts() || expiresAfterAccess())) {
+            accessOrderWindowDeque().remove(node);
+        }
+        // 如果没在窗口区
+        else if (evicts()) {
+            // 在试用区直接在试用区移除
+            if (node.inMainProbation()) {
+                accessOrderProbationDeque().remove(node);
+            }
+            // 在保护区则直接从保护区移除
+            else {
+                accessOrderProtectedDeque().remove(node);
+            }
+        }
+        // 将写后失效和时间轮中关于该节点的元素移除
+        if (expiresAfterWrite()) {
+            writeOrderDeque().remove(node);
+        } else if (expiresVariable()) {
+            timerWheel().deschedule(node);
+        }
+
+        // 同步机制将 node 置为 dead
+        synchronized (node) {
+            logIfAlive(node);
+            makeDead(node);
+        }
+
+        if (removed[0]) {
+            // 节点被移除监控计数和节点移除通知回调
+            statsCounter().recordEviction(node.getWeight(), actualCause[0]);
+            notifyRemoval(key, value[0], actualCause[0]);
+        }
+
+        return true;
+    }
+}
+```
+
+该方法比较简单，是将节点进行驱逐的逻辑，对应 `AddTask` 任务的逻辑中，当被添加的元素权重超过最大权重限制时会被直接移除。这种特殊情况试用于指定了权重计算策略的缓存，如果只指定了固定容量，元素权重默认为 1，不会直接超过最大缓存数量限制。
 
 ### getIfPresent
 
