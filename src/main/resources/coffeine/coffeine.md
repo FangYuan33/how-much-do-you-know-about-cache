@@ -128,7 +128,7 @@ interface LocalCacheFactory {
         }
         // 不同的驱逐策略
         if (builder.evicts()) {
-            // 基于最大大小
+            // 基于最大值限制，可能是最大权重W，也可能是最大容量S
             className.append('M');
             // 基于权重或非权重
             if (builder.isWeighted()) {
@@ -210,6 +210,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         // 标记是否定义了节点计算权重的 Weigher 对象
         isWeighted = builder.isWeighted();
         // 同步锁，在接下来的内容中会看到很多标记了 @GuardedBy("evictionLock") 注解的方法，表示这行这些方法时都会获取这把同步锁
+        // 根据该锁的命名，eviction 表示驱逐的意思，也就是说关注驱逐策略执行的方法都要获取该锁，这一点需要在后文中注意
         evictionLock = new ReentrantLock();
         // 计算元素权重的对象，不指定为 SingletonWeigher.INSTANCE
         weigher = builder.getWeigher(isAsync);
@@ -617,9 +618,32 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                     afterWrite(new AddTask(node, newWeight));
                     return null;
                 }
-                // ...
+                // onlyIfAbsent 在默认的 put 方法中为 false，以下逻辑简单介绍
+                // 如果此时有其他线程添加了相同 key 的元素
+                else if (onlyIfAbsent) {
+                    // 获取到当前值，尝试判断读后失效策略，更新访问时间，并执行写后方法 afterRead
+                    V currentValue = prior.getValue();
+                    if ((currentValue != null) && !hasExpired(prior, now)) {
+                        if (!isComputingAsync(prior)) {
+                            tryExpireAfterRead(prior, key, currentValue, expiry(), now);
+                            setAccessTime(prior, now);
+                        }
+                        afterRead(prior, now, /* recordHit */ false);
+                        return currentValue;
+                    }
+                }
+            } else if (onlyIfAbsent) {
+                // 同样的逻辑
+                V currentValue = prior.getValue();
+                if ((currentValue != null) && !hasExpired(prior, now)) {
+                    if (!isComputingAsync(prior)) {
+                        tryExpireAfterRead(prior, key, currentValue, expiry(), now);
+                        setAccessTime(prior, now);
+                    }
+                    afterRead(prior, now, /* recordHit */ false);
+                    return currentValue;
+                }
             }
-            // ...
         }
         // ...
     }
@@ -1483,6 +1507,387 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 该方法比较简单，是将节点进行驱逐的逻辑，对应 `AddTask` 任务的逻辑中，当被添加的元素权重超过最大权重限制时会被直接移除。这种特殊情况试用于指定了权重计算策略的缓存，如果只指定了固定容量，元素权重默认为 1，不会直接超过最大缓存数量限制。
 
+现在我们已经将 `put` 方法中向缓存中添加元素的逻辑介绍完了，接下来需要关注 `put` 方法中对已存在的相同 key 值元素的处理逻辑：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    static final int MAX_PUT_SPIN_WAIT_ATTEMPTS = 1024 - 1;
+
+    static final long EXPIRE_WRITE_TOLERANCE = TimeUnit.SECONDS.toNanos(1);
+    
+    final ConcurrentHashMap<Object, Node<K, V>> data;
+    
+    @Nullable
+    V put(K key, V value, Expiry<K, V> expiry, boolean onlyIfAbsent) {
+        requireNonNull(key);
+        requireNonNull(value);
+
+        Node<K, V> node = null;
+        long now = expirationTicker().read();
+        int newWeight = weigher.weigh(key, value);
+        Object lookupKey = nodeFactory.newLookupKey(key);
+        for (int attempts = 1; ; attempts++) {
+            Node<K, V> prior = data.get(lookupKey);
+            if (prior == null) {
+                // ... 
+            }
+
+            // 元素被读到之后可能已经被驱逐了
+            if (!prior.isAlive()) {
+                // 自旋尝试重新从 ConcurrentHashMap 中获取，再获取时如果为 null 则执行新增逻辑
+                if ((attempts & MAX_PUT_SPIN_WAIT_ATTEMPTS) != 0) {
+                    Thread.onSpinWait();
+                    continue;
+                }
+                // 如果自旋尝试后元素仍未被删除，校验元素是否处于存活状态
+                // 如果处于非存活状态，那么可能这个元素已经被破坏，无法被移除，抛出异常
+                data.computeIfPresent(lookupKey, (k, n) -> {
+                    requireIsAlive(key, n);
+                    return n;
+                });
+                continue;
+            }
+
+            V oldValue;
+            // 新的过期时间
+            long varTime;
+            int oldWeight;
+            boolean expired = false;
+            boolean mayUpdate = true;
+            boolean exceedsTolerance = false;
+            // 为元素加同步锁
+            synchronized (prior) {
+                // 如果此时元素已经失效了，那么需要重新循环
+                if (!prior.isAlive()) {
+                    continue;
+                }
+                oldValue = prior.getValue();
+                oldWeight = prior.getWeight();
+                // oldValue 为 null 证明它被垃圾回收器回收了
+                if (oldValue == null) {
+                    // 记录元素创建后的过期时间
+                    varTime = expireAfterCreate(key, value, expiry, now);
+                    // 驱逐监听器回调
+                    notifyEviction(key, null, RemovalCause.COLLECTED);
+                }
+                // 如果元素已经过期了
+                else if (hasExpired(prior, now)) {
+                    // 标记过期标志为 true
+                    expired = true;
+                    // 记录元素创建后的过期时间并回调驱逐监听器
+                    varTime = expireAftexpireAfterCreateerCreate(key, value, expiry, now);
+                    notifyEviction(key, oldValue, RemovalCause.EXPIRED);
+                }
+                // onlyInAbsent 为 true 时不会对已存在 key 的值进行修改
+                else if (onlyIfAbsent) {
+                    mayUpdate = false;
+                    // 记录元素读后过期时间
+                    varTime = expireAfterRead(prior, key, value, expiry, now);
+                } else {
+                    // 记录元素修改后过期时间
+                    varTime = expireAfterUpdate(prior, key, value, expiry, now);
+                }
+
+                // 需要修改原有 key 的 value 值
+                if (mayUpdate) {
+                    exceedsTolerance =
+                            // 配置了写后过期策略且已经超过写后时间的容忍范围
+                            (expiresAfterWrite() && (now - prior.getWriteTime()) > EXPIRE_WRITE_TOLERANCE)
+                                    // 或者配置了可变时间过期策略同样判断是否超过时间的容忍范围
+                                    || (expiresVariable() && Math.abs(varTime - prior.getVariableTime()) > EXPIRE_WRITE_TOLERANCE);
+
+                    // 更新值，更新权重，更新写时间
+                    prior.setValue(value, valueReferenceQueue());
+                    prior.setWeight(newWeight);
+                    setWriteTime(prior, now);
+
+                    // 写后刷新策略失效
+                    discardRefresh(prior.getKeyReference());
+                }
+
+                // 更新过期时间
+                setVariableTime(prior, varTime);
+                // 更新访问时间
+                setAccessTime(prior, now);
+            }
+
+            // 根据不同的情况回调不同的监听器
+            if (expired) {
+                notifyRemoval(key, oldValue, RemovalCause.EXPIRED);
+            } else if (oldValue == null) {
+                notifyRemoval(key, /* oldValue */ null, RemovalCause.COLLECTED);
+            } else if (mayUpdate) {
+                notifyOnReplace(key, oldValue, value);
+            }
+
+            // 计算写后权重变化
+            int weightedDifference = mayUpdate ? (newWeight - oldWeight) : 0;
+            // 如果 oldValue 已经被回收 或 权重修改前后发生变更 或 已经过期，添加更新任务
+            if ((oldValue == null) || (weightedDifference != 0) || expired) {
+                afterWrite(new UpdateTask(prior, weightedDifference));
+            }
+            // 如果超过了时间容忍范围，添加更新任务
+            else if (!onlyIfAbsent && exceedsTolerance) {
+                afterWrite(new UpdateTask(prior, weightedDifference));
+            } else {
+                // 没有超过时间容忍范围，更新写时间
+                if (mayUpdate) {
+                    setWriteTime(prior, now);
+                }
+                // 处理读后操作
+                afterRead(prior, now, /* recordHit */ false);
+            }
+
+            return expired ? null : oldValue;
+        }
+    }
+}
+```
+
+对于已有元素的变更，会对节点添加同步锁，更新它的权重等一系列变量，如果超过 1s 的时间容忍范围，则会添加 `UpdateTask` 更新任务，至于处理读后操作 `afterRead` 在读方法中再去介绍。接下来我们需要重新再看一下 `afterWrite` 方法，其中有部分我们在上文中没有介绍的逻辑：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    final ReentrantLock evictionLock;
+    
+    void afterWrite(Runnable task) {
+        // 这段逻辑我们在看 AddTask 的逻辑时已经看过了，所以略过
+        for (int i = 0; i < WRITE_BUFFER_RETRIES; i++) {
+            if (writeBuffer.offer(task)) {
+                scheduleAfterWrite();
+                return;
+            }
+            scheduleDrainBuffers();
+            Thread.onSpinWait();
+        }
+
+        // 以下逻辑用于解决在重试了 100 次后仍然写入失败的问题，它会尝试获取 evictionLock 同步锁
+        // 直接执行“维护”方法并执行当前任务，但是它并无法解决某个写入操作执行时间很长的问题
+        // 发生这种情况的原因可能是由于执行器的所有线程都很忙（可能是写入此缓存），写入速率大大超过了消耗速率，优先级反转，或者执行器默默地丢弃了维护任务
+        lock();
+        try {
+            maintenance(task);
+        } catch (RuntimeException e) {
+            logger.log(Level.ERROR, "Exception thrown when performing the maintenance task", e);
+        } finally {
+            evictionLock.unlock();
+        }
+        // 重新调度异步维护任务，确保维护操作能及时执行
+        rescheduleCleanUpIfIncomplete();
+    }
+
+    void lock() {
+        long remainingNanos = WARN_AFTER_LOCK_WAIT_NANOS;
+        long end = System.nanoTime() + remainingNanos;
+        boolean interrupted = false;
+        try {
+            for (;;) {
+                try {
+                    if (evictionLock.tryLock(remainingNanos, TimeUnit.NANOSECONDS)) {
+                        return;
+                    }
+                    logger.log(Level.WARNING, "The cache is experiencing excessive wait times for acquiring "
+                            + "the eviction lock. This may indicate that a long-running computation has halted "
+                            + "eviction when trying to remove the victim entry. Consider using AsyncCache to "
+                            + "decouple the computation from the map operation.", new TimeoutException());
+                    evictionLock.lock();
+                    return;
+                } catch (InterruptedException e) {
+                    remainingNanos = end - System.nanoTime();
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    // 调用同步的维护方法时，可能发生获取锁超时，那么再重新开启一个异步维护调度
+    void rescheduleCleanUpIfIncomplete() {
+        // 校验是否有任务需要被执行
+        if (drainStatusOpaque() != REQUIRED) {
+            return;
+        }
+        
+        // 默认线程池调度任务执行，这个方法我们在上文中已经详细介绍过
+        if (executor == ForkJoinPool.commonPool()) {
+            scheduleDrainBuffers();
+            return;
+        }
+        
+        // 如果自定义了线程池，那么会使用自定义的线程池进行处理
+        var pacer = pacer();
+        if ((pacer != null) && !pacer.isScheduled() && evictionLock.tryLock()) {
+            try {
+                if ((drainStatusOpaque() == REQUIRED) && !pacer.isScheduled()) {
+                    pacer.schedule(executor, drainBuffersTask, expirationTicker().read(), Pacer.TOLERANCE);
+                }
+            } finally {
+                evictionLock.unlock();
+            }
+        }
+    }
+}
+```
+
+写后操作除了在添加任务到缓冲区成功后会执行维护方法，添加失败（证明写入操作非常频繁）依然会尝试同步执行维护方法和发起异步维护，用于保证缓存中的任务能够被及时执行，使缓存中元素都处于“预期”状态中。接下来我们在看一下 `UpdateTask` 更新任务的逻辑：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    final class UpdateTask implements Runnable {
+        final int weightDifference;
+        final Node<K, V> node;
+
+        public UpdateTask(Node<K, V> node, int weightDifference) {
+            this.weightDifference = weightDifference;
+            this.node = node;
+        }
+
+        @Override
+        @GuardedBy("evictionLock")
+        public void run() {
+            // 写后过期和自定义过期逻辑
+            if (expiresAfterWrite()) {
+                reorder(writeOrderDeque(), node);
+            } else if (expiresVariable()) {
+                timerWheel().reschedule(node);
+            }
+            // 指定了驱逐策略
+            if (evicts()) {
+                // 变更节点权重
+                int oldWeightedSize = node.getPolicyWeight();
+                node.setPolicyWeight(oldWeightedSize + weightDifference);
+                // 如果是窗口区节点
+                if (node.inWindow()) {
+                    // 更新窗口区权重
+                    setWindowWeightedSize(windowWeightedSize() + weightDifference);
+                    // 节点权重超过最大权重限制，直接驱逐
+                    if (node.getPolicyWeight() > maximum()) {
+                        evictEntry(node, RemovalCause.SIZE, expirationTicker().read());
+                    }
+                    // 节点权重比窗口区最大值小
+                    else if (node.getPolicyWeight() <= windowMaximum()) {
+                        onAccess(node);
+                    }
+                    // 窗口区包含该节点且该节点的权重大于窗口最大权重，则放到头节点
+                    else if (accessOrderWindowDeque().contains(node)) {
+                        accessOrderWindowDeque().moveToFront(node);
+                    }
+                }
+                // 如果是试用区节点
+                else if (node.inMainProbation()) {
+                    // 节点权重比最大权重限制小
+                    if (node.getPolicyWeight() <= maximum()) {
+                        onAccess(node);
+                    }
+                    // 否则将该节点驱逐
+                    else {
+                        evictEntry(node, RemovalCause.SIZE, expirationTicker().read());
+                    }
+                }
+                // 如果是保护区节点
+                else if (node.inMainProtected()) {
+                    // 更新保护区权重
+                    setMainProtectedWeightedSize(mainProtectedWeightedSize() + weightDifference);
+                    // 同样的逻辑
+                    if (node.getPolicyWeight() <= maximum()) {
+                        onAccess(node);
+                    } else {
+                        evictEntry(node, RemovalCause.SIZE, expirationTicker().read());
+                    }
+                }
+
+                // 更新缓存权重大小
+                setWeightedSize(weightedSize() + weightDifference);
+                // 更新完成后超过最大权重限制执行驱逐操作
+                if (weightedSize() > MAXIMUM_CAPACITY) {
+                    evictEntries();
+                }
+            }
+            // 配置了访问后过期
+            else if (expiresAfterAccess()) {
+                onAccess(node);
+            }
+        }
+    }
+
+    @GuardedBy("evictionLock")
+    void onAccess(Node<K, V> node) {
+        if (evicts()) {
+            K key = node.getKey();
+            if (key == null) {
+                return;
+            }
+            // 更新访问频率
+            frequencySketch().increment(key);
+            // 如果节点在窗口区，则将其移动到尾节点
+            if (node.inWindow()) {
+                reorder(accessOrderWindowDeque(), node);
+            }
+            // 在试用区的节点执行 reorderProbation 方法，可能会将该节点从试用区晋升到保护区
+            else if (node.inMainProbation()) {
+                reorderProbation(node);
+            }
+            // 否则移动到保护区的尾结点
+            else {
+                reorder(accessOrderProtectedDeque(), node);
+            }
+            // 更新命中量
+            setHitsInSample(hitsInSample() + 1);
+        }
+        // 配置了访问过期策略
+        else if (expiresAfterAccess()) {
+            reorder(accessOrderWindowDeque(), node);
+        }
+        // 配置了自定义时间过期策略
+        if (expiresVariable()) {
+            timerWheel().reschedule(node);
+        }
+    }
+
+    static <K, V> void reorder(LinkedDeque<Node<K, V>> deque, Node<K, V> node) {
+        // 如果节点存在，将其移动到尾结点
+        if (deque.contains(node)) {
+            deque.moveToBack(node);
+        }
+    }
+
+    @GuardedBy("evictionLock")
+    void reorderProbation(Node<K, V> node) {
+        // 检查试用区是否包含该节点，不包含则证明已经被移除，则不处理
+        if (!accessOrderProbationDeque().contains(node)) {
+            return;
+        }
+        // 检查节点的权重是否超过保护区最大值
+        else if (node.getPolicyWeight() > mainProtectedMaximum()) {
+            // 如果超过，将该节点移动到 试用区 尾巴节点，保证超重的节点不会被移动到保护区
+            reorder(accessOrderProbationDeque(), node);
+            return;
+        }
+
+        // 更新保护区权重大小
+        setMainProtectedWeightedSize(mainProtectedWeightedSize() + node.getPolicyWeight());
+        // 在试用区中移除该节点
+        accessOrderProbationDeque().remove(node);
+        // 在保护区尾节点中添加
+        accessOrderProtectedDeque().offerLast(node);
+        // 将该节点标记为保护区节点
+        node.makeMainProtected();
+    }
+}
+```
+
+`UpdateTask` 修改任务负责变更权重值，并更新节点所在队列的顺序和访问频率，这里我们也能发现，这三个区域的队列采用了 **LRU 算法**，一般情况下，**最新被访问的元素会被移动到尾节点**。到现在，向有固定容量限制的缓存中调用 `put` 方法添加元素的逻辑基本已经介绍完了，目前对 caffeine 缓存的了解程度如下所示：
+
+![caffeine-第 2 页.drawio.png](caffeine-%E7%AC%AC%202%20%E9%A1%B5.drawio.png)
+
+`put` 添加元素时会先直接添加到 `ConcurrentHashMap` 中，并在 `WriteBuffer` 中添加 `AddTask/UpdateTask` 任务，`WriteBuffer` 是一个 **MPSC** 的缓冲区，缓冲区中的任务由 **单线程** 执行 `PerformCleanupTask` 任务调用 `maintenance` 维护方法执行，维护方法执行 `AddTask` 任务时会将元素先添加到窗口区，如果是 `UpdateTask`，它会修改三个不同区域的双端队列，这些队列采用了LRU算法，最新被访问的元素会被放在尾节点处，并且试用区的元素被访问后会被晋升到保护区尾节点，元素对应的访问频率也会在频率草图中更新，如果被添加的节点权重超过缓存最大权重会直接被驱逐。目前维护方法中除了 `drainWeiteBuffer` 方法外，其他步骤还未详细解释，之后会在后文中不断完善。
+
 ### getIfPresent
 
 ```java
@@ -1676,65 +2081,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {
         };
     }
-
-    @GuardedBy("evictionLock")
-    void onAccess(Node<K, V> node) {
-        if (evicts()) {
-            K key = node.getKey();
-            if (key == null) {
-                return;
-            }
-            // 更新访问频率
-            frequencySketch().increment(key);
-            // 根据节点所在位置执行对应的重排序方法
-            if (node.inWindow()) {
-                reorder(accessOrderWindowDeque(), node);
-            }
-            // 在试用区的节点执行 reorderProbation 方法，可能会将该节点从试用区晋升到保护区
-            else if (node.inMainProbation()) {
-                reorderProbation(node);
-            } else {
-                reorder(accessOrderProtectedDeque(), node);
-            }
-            setHitsInSample(hitsInSample() + 1);
-        } else if (expiresAfterAccess()) {
-            reorder(accessOrderWindowDeque(), node);
-        }
-        if (expiresVariable()) {
-            timerWheel().reschedule(node);
-        }
-    }
-
-    static <K, V> void reorder(LinkedDeque<Node<K, V>> deque, Node<K, V> node) {
-        // 如果节点存在，将其移动到尾结点
-        if (deque.contains(node)) {
-            deque.moveToBack(node);
-        }
-    }
-
-    @GuardedBy("evictionLock")
-    void reorderProbation(Node<K, V> node) {
-        // 检查试用区是否包含该节点，不包含则证明已经被移除，则不处理
-        if (!accessOrderProbationDeque().contains(node)) {
-            return;
-        }
-        // 检查节点的权重是否超过保护区最大值
-        else if (node.getPolicyWeight() > mainProtectedMaximum()) {
-            // 如果超过，将该节点移动到 试用区 尾巴节点，保证超重的节点不会被移动到保护区
-            reorder(accessOrderProbationDeque(), node);
-            return;
-        }
-
-
-        // 更新保护区权重大小
-        setMainProtectedWeightedSize(mainProtectedWeightedSize() + node.getPolicyWeight());
-        // 在试用区中移除该节点
-        accessOrderProbationDeque().remove(node);
-        // 在保护区尾节点中添加
-        accessOrderProtectedDeque().offerLast(node);
-        // 将该节点标记为保护区节点
-        node.makeMainProtected();
-    }
+    
 }
 ```
 
