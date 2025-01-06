@@ -1886,7 +1886,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 ![caffeine-第 2 页.drawio.png](caffeine-%E7%AC%AC%202%20%E9%A1%B5.drawio.png)
 
-`put` 添加元素时会先直接添加到 `ConcurrentHashMap` 中，并在 `WriteBuffer` 中添加 `AddTask/UpdateTask` 任务，`WriteBuffer` 是一个 **MPSC** 的缓冲区，缓冲区中的任务由 **单线程** 执行 `PerformCleanupTask` 任务调用 `maintenance` 维护方法执行，维护方法执行 `AddTask` 任务时会将元素先添加到窗口区，如果是 `UpdateTask`，它会修改三个不同区域的双端队列，这些队列采用了LRU算法，最新被访问的元素会被放在尾节点处，并且试用区的元素被访问后会被晋升到保护区尾节点，元素对应的访问频率也会在频率草图中更新，如果被添加的节点权重超过缓存最大权重会直接被驱逐。目前维护方法中除了 `drainWeiteBuffer` 方法外，其他步骤还未详细解释，之后会在后文中不断完善。
+`put` 添加元素时会先直接添加到 `ConcurrentHashMap` 中，并在 `WriteBuffer` 中添加 `AddTask/UpdateTask` 任务，`WriteBuffer` 是一个 **MPSC** 的缓冲区，添加成功后会有加锁的同步机制在默认的 `ForkJoinPool.commonPool()` 线程池中提交 `PerformCleanupTask` 任务，`PerformCleanupTask` 任务的主要作用是执行 `maintenance` 维护方法，该方法执行前需要先获取同步锁，单线程消费 `WriteBuffer` 中的任务。执行 `AddTask` 任务时会将元素先添加到窗口区，如果是 `UpdateTask`，它会修改三个不同区域的双端队列，这些队列采用LRU算法，最新被访问的元素会被放在尾节点处，并且试用区的元素被访问后会被晋升到保护区尾节点，元素对应的访问频率也会在频率草图中更新，如果被添加的节点权重超过缓存最大权重会直接被驱逐。（目前维护方法中除了 `drainWeiteBuffer` 方法外，其他步骤还未详细解释，之后会在后文中不断完善）
 
 ### getIfPresent
 
