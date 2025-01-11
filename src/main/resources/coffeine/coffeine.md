@@ -2073,7 +2073,7 @@ enum DisabledBuffer implements Buffer<Object> {
 `readBuffer` 的实际类型为 `BoundedBuffer`，它的类关系图如下：
 
 
-在 `Buffer` 接口的注释声明中，能获取很多有效信息：它同样也是 **多生产者单消费者（MPSC）** 缓冲区，上文我们在介绍`WriteBuffer` 时，它的单消费者实现方式是加同步锁，`ReadBuffer` 的实现方式一样，因为它们都是在维护方法 `maintenance` 中加同步锁对元素进行消费。此外，如果 `ReadBuffer` 缓冲区满了或者发生争抢则会拒绝添加新元素，它不像队列或栈，不保证 FIFO 或 LIFO。因为实现中不保证多消费者情况下正常，所以调用者需要保证消费者对该缓存的独占权。
+在 `Buffer` 接口的注释声明中，能获取很多有效信息：它同样也是 **多生产者单消费者（MPSC）** 缓冲区，上文我们在介绍`WriteBuffer` 时，它的单消费者实现方式是加同步锁，`ReadBuffer` 的实现方式一样，因为它们都是在维护方法 `maintenance` 中加同步锁对元素进行消费。此外，如果 `ReadBuffer` 缓冲区满了或者发生争抢则会拒绝添加新元素，而且它不像队列或栈，**不保证 FIFO 或 LIFO**。因为实现中不保证多消费者情况下正常，所以调用者需要保证消费者对该缓存的独占权。
 
 > A multiple-producer / single-consumer buffer that rejects new elements if it is full or fails spuriously due to contention. Unlike a queue and stack, a buffer does not guarantee an ordering of elements in either FIFO or LIFO order.
 Beware that it is the responsibility of the caller to ensure that a consumer has exclusive read access to the buffer. This implementation does not include fail-fast behavior to guard against incorrect consumer usage.
@@ -2129,6 +2129,7 @@ final class BoundedBuffer<E> extends StripedBuffer<E> {
 
         final Object[] buffer;
 
+        // 有参构造，这里表示缓冲区是被延迟创建的，创建时第一个元素便为 e
         public RingBuffer(E e) {
             buffer = new Object[BUFFER_SIZE];
             BUFFER.set(buffer, 0, e);
@@ -2220,65 +2221,106 @@ final class BBHeader {
 
 在 `BBHeader` 类中又看到了熟悉的 120 字节内存占位，在上文中我们详细介绍过，这样能够保证 `readCounter` 和 `writeCounter` 分布在不同内存行，**避免了内存伪共享问题**，保证不同线程读取这两个字段时互不影响。在添加元素的 `offer` 方法和消费元素的 `drainTo` 方法中，都能看见它使用了“读索引readCounter”和“写索引writeCounter”，这也对应了它命名中的 **Ring**。**Ring** 表示环形，读、写索引在操作过程中会不断累加，但是它会执行位与运算保证索引值一直落在缓冲区长度的有效范围内，也就是说这两个索引值会不断在有效索引范围内“转圈”，则形成一个“环形”缓冲区。
 
-`RingBuffer` 通过 CAS 操作来确保并发添加元素操作的安全，如果 CAS 操作失败则返回 `Buffer.FAILED`，这时便会执行 `StripedBuffer#expandOrRetry` 方法，我们先来看一下它的方法注释内容，它说：
+`RingBuffer` 通过 CAS 操作来确保并发添加元素操作的安全，如果 CAS 操作失败则返回 `Buffer.FAILED`，这时便会执行 `StripedBuffer#expandOrRetry` 方法，我们先来看一下它的方法注释内容，它说：这个方法用于处理写过程中发生的初始化、扩容、创建新缓存或竞争写情况。
 
-> Handles cases of updates involving initialization, resizing, creating new Buffers, and/ or contention. See above for explanation. This method suffers the usual non-modularity problems of optimistic retry code, relying on rechecked sets of reads.
+> Handles cases of updates involving initialization, resizing, creating new Buffers, and/ or contention.
+
+具体源码如下：
 
 ```java
 abstract class StripedBuffer<E> implements Buffer<E> {
+    // 最大尝试 3 次
+    static final int ATTEMPTS = 3;
+
+    // table 的最大大小
+    static final int MAXIMUM_TABLE_SIZE = 4 * ceilingPowerOfTwo(NCPU);
+    
+    // 1 表示忙碌（扩容或正在创建）0 表示缓冲区无操作，通过 CAS 操作进行更新
+    volatile int tableBusy;
+    
+    volatile Buffer<E> @Nullable[] table;
+
+    /**
+     * 扩展或重试
+     *  
+     * @param e 元素
+     * @param h 调用该方法时为线程探针值高 32 位，但在方法中会变更
+     * @param increment 线程探针值高 32 位
+     * @param wasUncontended true 未发生竞争 false 发生竞争
+     */
     final int expandOrRetry(E e, int h, int increment, boolean wasUncontended) {
         int result = Buffer.FAILED;
-        boolean collide = false; // True if last slot nonempty
+        // true 标志缓冲区中最后一个槽位非空 false 表示为空
+        boolean collide = false;
         for (int attempt = 0; attempt < ATTEMPTS; attempt++) {
             Buffer<E>[] buffers;
             Buffer<E> buffer;
             int n;
+            // 如果缓冲区数组已经被创建
             if (((buffers = table) != null) && ((n = buffers.length) > 0)) {
+                // 检查具体的缓冲区是否为空
                 if ((buffer = buffers[(n - 1) & h]) == null) {
-                    if ((tableBusy == 0) && casTableBusy()) { // Try to attach new Buffer
+                    // 准备创建缓冲区，并更新 tableBusy 标志为 1
+                    if ((tableBusy == 0) && casTableBusy()) {
                         boolean created = false;
-                        try { // Recheck under lock
+                        try { 
                             Buffer<E>[] rs;
                             int mask, j;
                             if (((rs = table) != null) && ((mask = rs.length) > 0)
                                     && (rs[j = (mask - 1) & h] == null)) {
+                                // 创建缓冲区 return new RingBuffer<>(e);
                                 rs[j] = create(e);
                                 created = true;
                             }
                         } finally {
                             tableBusy = 0;
                         }
+                        // 如果创建成功
                         if (created) {
                             result = Buffer.SUCCESS;
                             break;
                         }
-                        continue; // Slot is now non-empty
+                        // 缓冲区已经被其他线程创建了，重新循环重试
+                        continue;
                     }
                     collide = false;
-                } else if (!wasUncontended) { // CAS already known to fail
-                    wasUncontended = true;      // Continue after rehash
-                } else if ((result = buffer.offer(e)) != Buffer.FAILED) {
+                }
+                // 如果发生竞争，表示向缓冲区中CAS添加元素失败
+                else if (!wasUncontended) {
+                    wasUncontended = true;
+                } 
+                // 如果重试添加元素成功，结束循环
+                else if ((result = buffer.offer(e)) != Buffer.FAILED) {
                     break;
-                } else if ((n >= MAXIMUM_TABLE_SIZE) || (table != buffers)) {
-                    collide = false; // At max size or stale
+                }
+                // table 超过最大大小或已完成扩容但未变更引用（stale）
+                else if ((n >= MAXIMUM_TABLE_SIZE) || (table != buffers)) {
+                    collide = false;
                 } else if (!collide) {
                     collide = true;
-                } else if ((tableBusy == 0) && casTableBusy()) {
+                }
+                // 扩容操作，将缓冲区数组扩容为原来的两倍大小
+                // 扩容条件：未超过最大 table 限制且重试添加元素依然失败
+                else if ((tableBusy == 0) && casTableBusy()) {
                     try {
-                        if (table == buffers) { // Expand table unless stale
+                        if (table == buffers) {
                             table = Arrays.copyOf(buffers, n << 1);
                         }
                     } finally {
                         tableBusy = 0;
                     }
                     collide = false;
-                    continue; // Retry with expanded table
+                    continue;
                 }
+                // 变更探针哈希值，尝试下一个索引位置
                 h += increment;
-            } else if ((tableBusy == 0) && (table == buffers) && casTableBusy()) {
+            }
+            // 缓冲区数组的初始化逻辑
+            else if ((tableBusy == 0) && (table == buffers) && casTableBusy()) {
                 boolean init = false;
-                try { // Initialize table
+                try {
                     if (table == buffers) {
+                        // 初始大小为 1，会随着扩容不断将容量扩大两倍
                         @SuppressWarnings({"rawtypes", "unchecked"})
                         Buffer<E>[] rs = new Buffer[1];
                         rs[0] = create(e);
@@ -2288,6 +2330,7 @@ abstract class StripedBuffer<E> implements Buffer<E> {
                 } finally {
                     tableBusy = 0;
                 }
+                // 完成初始化，元素添加成功
                 if (init) {
                     result = Buffer.SUCCESS;
                     break;
@@ -2298,6 +2341,30 @@ abstract class StripedBuffer<E> implements Buffer<E> {
     }
 }
 ```
+
+根据注释信息了解该方法的逻辑并不难，接下来我们再看一下它的消费方法 `drainTo`，非常简单：
+
+```java
+abstract class StripedBuffer<E> implements Buffer<E> {
+    volatile Buffer<E> @Nullable[] table;
+    
+    @Override
+    public void drainTo(Consumer<E> consumer) {
+        Buffer<E>[] buffers = table;
+        if (buffers == null) {
+            return;
+        }
+        // 循环遍历消费所有缓冲区
+        for (Buffer<E> buffer : buffers) {
+            if (buffer != null) {
+                buffer.drainTo(consumer);
+            }
+        }
+    }
+}
+```
+
+总结一下，`ReadBuffer` 是一个 MPSC 的缓冲区，采用了分段的思想和CAS操作来保证多线程写入操作高效执行。因为它没有记录元素的写入顺序，所以它并不会像栈或队列一样保证 FIFO 或 LIFO。随着写入竞争发生会不断对缓冲区数组扩容，每次扩容为原来大小的两倍，每个缓冲区为环形缓冲区，通过位与元素计算实际的索引，将被消费的元素标记为 null 实现元素中槽位的重用。
 
 ### maintenance
 
