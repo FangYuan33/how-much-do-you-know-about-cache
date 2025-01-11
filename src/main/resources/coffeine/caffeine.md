@@ -2072,6 +2072,7 @@ enum DisabledBuffer implements Buffer<Object> {
 
 `readBuffer` 的实际类型为 `BoundedBuffer`，它的类关系图如下：
 
+![BoundBuffer.drawio.png](BoundBuffer.drawio.png)
 
 在 `Buffer` 接口的注释声明中，能获取很多有效信息：它同样也是 **多生产者单消费者（MPSC）** 缓冲区，上文我们在介绍`WriteBuffer` 时，它的单消费者实现方式是加同步锁，`ReadBuffer` 的实现方式一样，因为它们都是在维护方法 `maintenance` 中加同步锁对元素进行消费。此外，如果 `ReadBuffer` 缓冲区满了或者发生争抢则会拒绝添加新元素，而且它不像队列或栈，**不保证 FIFO 或 LIFO**。因为实现中不保证多消费者情况下正常，所以调用者需要保证消费者对该缓存的独占权。
 
