@@ -2174,7 +2174,7 @@ final class BoundedBuffer<E> extends StripedBuffer<E> {
             if (size == 0) {
                 return;
             }
-            // 循环获取待消费元素
+            // 循环遍历消费缓冲区中所有元素
             do {
                 // 计算具体的索引
                 int index = (int) (head & MASK);
@@ -2415,7 +2415,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 #### drainReadBuffer
 
-首先我们来看步骤一处理读缓冲区：
+首先我们来看处理读缓冲区的逻辑，源码如下：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -2434,40 +2434,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-它在这里会执行到 `BoundedBuffer#drainTo` 方法，并且入参了 `Consumer<Node<K, V>> accessPolicy`
-
-```java
-final class BoundedBuffer<E> extends StripedBuffer<E> {
-    static final class RingBuffer<E> extends BBHeader.ReadAndWriteCounterRef implements Buffer<E> {
-        static final VarHandle BUFFER = MethodHandles.arrayElementVarHandle(Object[].class);
-
-        @Override
-        public void drainTo(Consumer<E> consumer) {
-            long head = readCounter;
-            long tail = writeCounterOpaque();
-            long size = (tail - head);
-            if (size == 0) {
-                return;
-            }
-            do {
-                int index = (int) (head & MASK);
-                @SuppressWarnings("unchecked")
-                E e = (E) BUFFER.getAcquire(buffer, index);
-                if (e == null) {
-                    // not published yet
-                    break;
-                }
-                BUFFER.setRelease(buffer, index, null);
-                consumer.accept(e);
-                head++;
-            } while (head != tail);
-            setReadCounterOpaque(head);
-        }
-    }
-}
-```
-
-接下来我们看一下为 `accessPolicy` 赋值的逻辑
+它会执行到 `StripedBuffer#drainTo` 方法，并且入参了 `Consumer<Node<K, V>> accessPolicy` 消费者。前者会遍历所有缓冲区中对象进行消费；后者在 caffeine 构造方法中完成初始化：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -2485,12 +2452,53 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-在这个方法中有一段注释非常重要，它说：
+`onAccess` 方法在上文中也提到过，具体逻辑我们在这里赘述下：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    @GuardedBy("evictionLock")
+    void onAccess(Node<K, V> node) {
+        if (evicts()) {
+            K key = node.getKey();
+            if (key == null) {
+                return;
+            }
+            // 更新访问频率
+            frequencySketch().increment(key);
+            // 如果节点在窗口区，则将其移动到尾节点
+            if (node.inWindow()) {
+                reorder(accessOrderWindowDeque(), node);
+            }
+            // 在试用区的节点执行 reorderProbation 方法，可能会将该节点从试用区晋升到保护区
+            else if (node.inMainProbation()) {
+                reorderProbation(node);
+            }
+            // 否则移动到保护区的尾结点
+            else {
+                reorder(accessOrderProtectedDeque(), node);
+            }
+            // 更新命中量
+            setHitsInSample(hitsInSample() + 1);
+        }
+        // 配置了访问过期策略
+        else if (expiresAfterAccess()) {
+            reorder(accessOrderWindowDeque(), node);
+        }
+        // 配置了自定义时间过期策略
+        if (expiresVariable()) {
+            timerWheel().reschedule(node);
+        }
+    }
+}
+```
+
+简单概括来说：`ReadBuffer` 中所有的元素都会被执行 `onAccess` 的逻辑，频率草图会被更新，窗口区元素会被移动到该区的尾结点，试用区元素在满足条件的情况下会被晋升到保护区。在这个方法中有一段注释非常重要，它说：
 
 > If the protected space exceeds its maximum, the LRU items are demoted to the probation space.
 > This is deferred to the adaption phase at the end of the maintenance cycle.
 
-如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行。
+如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行，也就是后续我们会介绍的 `climb` 方法。
 
 #### evictEntries
 
