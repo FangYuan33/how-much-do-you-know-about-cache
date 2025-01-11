@@ -2018,7 +2018,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-在深入具体源码前，我们还是先来介绍数据结构 `ReadBuffer`，它在 caffeine 的构造方法中完成初始化：
+该方法非常简单，都是熟悉的内容，只需要了解数据结构 `ReadBuffer`，它在 caffeine 的构造方法中完成初始化。
+
+#### ReadBuffer
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
@@ -2367,7 +2369,11 @@ abstract class StripedBuffer<E> implements Buffer<E> {
 
 总结一下，`ReadBuffer` 是一个 MPSC 的缓冲区，采用了分段的思想和CAS操作来保证多线程写入操作高效执行。因为它没有记录元素的写入顺序，所以它并不会像栈或队列一样保证 FIFO 或 LIFO。随着写入竞争发生会不断对缓冲区数组扩容，每次扩容为原来大小的两倍，每个缓冲区为环形缓冲区，通过位与元素计算实际的索引，将被消费的元素标记为 null 实现元素中槽位的重用。
 
+现在读写方法已经了解差不多了，需要我们再次回到维护方法 `maintenance` 中，看一看消费读缓冲区和其他逻辑。
+
 ### maintenance
+
+维护方法 `maintenance` 如下所示，第 2 步中处理写缓冲区任务的逻辑已在上文中介绍过，接下来我们会关注第 1 步的处理读缓冲区任务，第 4 步驱逐策略和第 5 步的 “增值（climb）”操作。
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -2406,6 +2412,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
     }
 }
 ```
+
+#### drainReadBuffer
 
 首先我们来看步骤一处理读缓冲区：
 
@@ -2484,9 +2492,11 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行。
 
-Main Probation: 试用区
+#### evictEntries
 
-Main Protected: 保护区
+
+
+#### climb
 
 那么，我们在这里假设，执行 `maintenance` 方法时其他处理写缓冲区方法等均无需特别处理，直接跳转到最后的 `climb`
 ，看看它是如何为缓存“增值（climb）”的：
