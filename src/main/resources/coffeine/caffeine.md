@@ -1890,7 +1890,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 ![caffeine-第 2 页.drawio.png](caffeine-%E7%AC%AC%202%20%E9%A1%B5.drawio.png)
 
-`put` 添加元素时会先直接添加到 `ConcurrentHashMap` 中，并在 `WriteBuffer` 中添加 `AddTask/UpdateTask` 任务，`WriteBuffer` 是一个 **MPSC** 的缓冲区，添加成功后会有加锁的同步机制在默认的 `ForkJoinPool.commonPool()` 线程池中提交 `PerformCleanupTask` 任务，`PerformCleanupTask` 任务的主要作用是执行 `maintenance` 维护方法，该方法执行前需要先获取同步锁，单线程消费 `WriteBuffer` 中的任务。执行 `AddTask` 任务时会将元素先添加到窗口区，如果是 `UpdateTask`，它会修改三个不同区域的双端队列，这些队列采用LRU算法，最新被访问的元素会被放在尾节点处，并且试用区的元素被访问后会被晋升到保护区尾节点，元素对应的访问频率也会在频率草图中更新，如果被添加的节点权重超过缓存最大权重会直接被驱逐。（目前维护方法中除了 `drainWeiteBuffer` 方法外，其他步骤还未详细解释，之后会在后文中不断完善）
+`put` 添加元素时会先直接添加到 `ConcurrentHashMap` 中，并在 `WriteBuffer` 中添加 `AddTask/UpdateTask` 任务，`WriteBuffer` 是一个 **MPSC** 的缓冲区，添加成功后会有加锁的同步机制在默认的 `ForkJoinPool.commonPool()` 线程池中提交 `PerformCleanupTask` 任务，`PerformCleanupTask` 任务的主要作用是执行 `maintenance` 维护方法，该方法执行前需要先获取同步锁，单线程消费 `WriteBuffer` 中的任务。执行 `AddTask` 任务时会将元素先添加到窗口区，如果是 `UpdateTask`，它会修改三个不同区域的双端队列，这些队列采用LRU算法，最新被访问的元素会被放在尾节点处，并且试用区的元素被访问后会被晋升到保护区尾节点，元素对应的访问频率也会在频率草图中更新，如果被添加的节点权重超过缓存最大权重会直接被驱逐。（目前维护方法中除了 `drainWriteBuffer` 方法外，其他步骤还未详细解释，之后会在后文中不断完善）
 
 ### getIfPresent
 
@@ -2497,16 +2497,244 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 ![caffeine-第 3 页.drawio.png](caffeine-%E7%AC%AC%203%20%E9%A1%B5.drawio.png)
 
-在 `onAccess` 方法中有一段注释比较有意思，它说：
+在 `reorderProbation` 方法中有一段注释比较有意思，它说：如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行，也就是后续我们会介绍的 `climb` 方法。
 
 > If the protected space exceeds its maximum, the LRU items are demoted to the probation space.
 > This is deferred to the adaption phase at the end of the maintenance cycle.
 
-如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行，也就是后续我们会介绍的 `climb` 方法。
-
 #### evictEntries
 
-`evictEntries` 驱逐元素
+`evictEntries` 方法注释这么描述：如果缓存超过最大值则将元素驱逐。
+
+> Evicts entries if the cache exceeds the maximum
+
+它的主方法逻辑非常简单：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    @GuardedBy("evictionLock")
+    void evictEntries() {
+        if (!evicts()) {
+            return;
+        }
+        // 从窗口区“驱逐”
+        var candidate = evictFromWindow();
+        // 从候选区或保护区进行驱逐
+        evictFromMain(candidate);
+    }
+}
+```
+
+首先，先来看从窗口区“驱逐”的方法 `evictFromWindow`:
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    @GuardedBy("evictionLock")
+    @Nullable
+    Node<K, V> evictFromWindow() {
+        Node<K, V> first = null;
+        // 获取队首元素
+        Node<K, V> node = accessOrderWindowDeque().peekFirst();
+        // 循环操作，直到窗口区权重小于窗口区权重最大限制
+        while (windowWeightedSize() > windowMaximum()) {
+            if (node == null) {
+                break;
+            }
+
+            // 获取队首节点的下一个节点
+            Node<K, V> next = node.getNextInAccessOrder();
+            // 如果队首节点权重不为 0
+            if (node.getPolicyWeight() != 0) {
+                // 标记为试用区节点并移动到试用区尾节点
+                node.makeMainProbation();
+                accessOrderWindowDeque().remove(node);
+                accessOrderProbationDeque().offerLast(node);
+                // 记录队首节点引用
+                if (first == null) {
+                    first = node;
+                }
+
+                // 更新窗口区权重
+                setWindowWeightedSize(windowWeightedSize() - node.getPolicyWeight());
+            }
+            // node 记录操作完成后的下一个头节点
+            node = next;
+        }
+
+        // 返回此时的头节点
+        return first;
+    }
+}
+```
+
+该方法会根据窗口区最大权重限制 **将节点由窗口区移动到试用区**，直到窗口区内元素小于最大值限制，并不是直接调用 `evictEntry` 方法真正地将元素驱逐。如果已经在窗口区中将元素移动到试用区，那么接下来会以窗口区头节点会作为入参执行 `evictFromMain` 方法，它有非常详细的注释内容：
+
+如果缓存超过最大容量限制，则将元素从主空间中移除。主空间通过频率草图决定从窗口区来的元素是被驱逐还是被保留，以便将使用频率最低的元素移除。
+
+窗口区的元素被提升到试用区尾节点（MRU 位置），驱逐策略驱逐的元素从试用区头节点（LRU 位置）开始。在需要执行驱逐策略时，元素会按照由头节点到尾节点的顺序进行评估，如果评估完试用区和保护区仍然需要驱逐元素，那么则会从窗口区驱逐。相似地，如果试用区驱逐完元素后仍然不够，则需要从保护区检查元素进行驱逐。队列按照从头节点到尾节点的顺序消费，使用频率相对较低的元素先被驱逐，在相同频率的情况下，优先保留主空间中的元素而不是窗口区元素。
+
+> Evicts entries from the main space if the cache exceeds the maximum capacity. The main space determines whether admitting an entry (coming from the window space) is preferable to retaining the eviction policy's victim. This decision is made using a frequency filter so that the least frequently used entry is removed.
+>
+> The window space's candidates were previously promoted to the probation space at its MRU position and the eviction policy's victim starts at the LRU position. The candidates are evaluated in promotion order while an eviction is required, and if exhausted then additional entries are retrieved from the window space. Likewise, if the victim selection exhausts the probation space then additional entries are retrieved the protected space. The queues are consumed in LRU order and the evicted entry is the one with a lower relative frequency, where the preference is to retain the main space's victims versus the window space's candidates on a tie.
+
+接下来我们看下源码的具体实现：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    public static final int WINDOW = 0;
+    public static final int PROBATION = 1;
+    public static final int PROTECTED = 2;
+    
+    static final int ADMIT_HASHDOS_THRESHOLD = 6;
+    
+    // 为了方便理解，定义 victim 为驱逐区，candidate 为候选驱逐区，实际上它们不对应区域，而是对应某个区域中的节点元素
+    @GuardedBy("evictionLock")
+    void evictFromMain(@Nullable Node<K, V> candidate) {
+        int victimQueue = PROBATION;
+        int candidateQueue = PROBATION;
+        // 首先获取试用区头节点作为首先要被驱逐的区域
+        Node<K, V> victim = accessOrderProbationDeque().peekFirst();
+        // 如果权重大小超过最大值，不断地执行驱逐策略，直到满足条件
+        while (weightedSize() > maximum()) {
+            // 首次循环，如果候选驱逐区为空，表示在窗口区操作时 evictFromWindow 未将窗口区元素晋升到试用区
+            if ((candidate == null) && (candidateQueue == PROBATION)) {
+                // 指定候选驱逐区为窗口区
+                candidate = accessOrderWindowDeque().peekFirst();
+                candidateQueue = WINDOW;
+            }
+            
+            // 候选驱逐区和驱逐区都为空
+            if ((candidate == null) && (victim == null)) {
+                // 当前驱逐区为试用区，指定保护区为驱逐区
+                if (victimQueue == PROBATION) {
+                    victim = accessOrderProtectedDeque().peekFirst();
+                    victimQueue = PROTECTED;
+                    continue;
+                }
+                // 当前驱逐区为保护区，指定驱逐区为窗口区
+                else if (victimQueue == PROTECTED) {
+                    victim = accessOrderWindowDeque().peekFirst();
+                    victimQueue = WINDOW;
+                    continue;
+                }
+
+                // 没有更多元素供驱逐，则退出循环
+                break;
+            }
+
+            // 跳过权重为 0 的元素，权重为 0 表示无需驱逐
+            if ((victim != null) && (victim.getPolicyWeight() == 0)) {
+                victim = victim.getNextInAccessOrder();
+                continue;
+            } else if ((candidate != null) && (candidate.getPolicyWeight() == 0)) {
+                candidate = candidate.getNextInAccessOrder();
+                continue;
+            }
+
+            // 如果要驱逐区为空，则从候选驱逐区中进行驱逐
+            if (victim == null) {
+                // 驱逐当前节点并将指针指向下一个节点 
+                Node<K, V> previous = candidate.getNextInAccessOrder();
+                Node<K, V> evict = candidate;
+                candidate = previous;
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }
+            // 候选驱逐区为空，在驱逐区中驱逐元素
+            else if (candidate == null) {
+                Node<K, V> evict = victim;
+                victim = victim.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }
+
+            // 驱逐区和候选驱逐区是同一个区的元素
+            if (candidate == victim) {
+                victim = victim.getNextInAccessOrder();
+                evictEntry(candidate, RemovalCause.SIZE, 0L);
+                candidate = null;
+                continue;
+            }
+
+            // 如果元素已经被垃圾回收，则驱逐
+            K victimKey = victim.getKey();
+            K candidateKey = candidate.getKey();
+            if (victimKey == null) {
+                Node<K, V> evict = victim;
+                victim = victim.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.COLLECTED, 0L);
+                continue;
+            } else if (candidateKey == null) {
+                Node<K, V> evict = candidate;
+                candidate = candidate.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.COLLECTED, 0L);
+                continue;
+            }
+
+            // 如果元素已经被标记为删除，驱逐它们
+            if (!victim.isAlive()) {
+                Node<K, V> evict = victim;
+                victim = victim.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            } else if (!candidate.isAlive()) {
+                Node<K, V> evict = candidate;
+                candidate = candidate.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }
+
+            // 如果候选区节点元素超过最大权重，直接驱逐
+            if (candidate.getPolicyWeight() > maximum()) {
+                Node<K, V> evict = candidate;
+                candidate = candidate.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+                continue;
+            }
+
+            // 驱逐频率较低的元素
+            if (admit(candidateKey, victimKey)) {
+                Node<K, V> evict = victim;
+                victim = victim.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+                // 变更候选区元素引用
+                candidate = candidate.getNextInAccessOrder();
+            } else {
+                Node<K, V> evict = candidate;
+                candidate = candidate.getNextInAccessOrder();
+                evictEntry(evict, RemovalCause.SIZE, 0L);
+            }
+        }
+    }
+
+    @GuardedBy("evictionLock")
+    boolean admit(K candidateKey, K victimKey) {
+        // 获取候选驱逐区中元素频率
+        int victimFreq = frequencySketch().frequency(victimKey);
+        int candidateFreq = frequencySketch().frequency(candidateKey);
+        // 候选区元素频率大于驱逐区中元素返回 true
+        if (candidateFreq > victimFreq) {
+            return true;
+        }
+        // 如果候选区元素频率大于 6
+        else if (candidateFreq >= ADMIT_HASHDOS_THRESHOLD) {
+            // 计算随机值来决定两元素之间的去留
+            int random = ThreadLocalRandom.current().nextInt();
+            return ((random & 127) == 0);
+            // 使用计算随机值的方法来防止 HASH DOS 攻击，攻击者可能人为地将某些不被常用的缓存访问频率提高，如果不计算随机性那么会将真正有价值的元素驱逐，添加这种随机性计算可能减少这种攻击带来的影响，保证缓存的有效命中率
+        }
+        // 候选驱逐区元素小于驱逐区元素频率
+        return false;
+    }
+}
+```
+
+元素的驱逐流程根据注释可以很清楚的了解，窗口区中元素会优先被晋升到试用区，在试用区和保护区中不断的驱逐节点知道满足条件，如果驱逐完成之后还不够则会从窗口区中驱逐元素，此外，使用随机驱逐的方式来减少 HASH DOS 攻击带来的影响也值得学习，更新原理图如下：
+
+![caffeine-第 4 页.drawio.png](caffeine-%E7%AC%AC%204%20%E9%A1%B5.drawio.png)
 
 #### climb
 
@@ -2726,8 +2954,6 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 }
 ```
-
-- policy weight 的含义 与 policy 有关系吗？
 
 ### 巨人的肩膀
 
