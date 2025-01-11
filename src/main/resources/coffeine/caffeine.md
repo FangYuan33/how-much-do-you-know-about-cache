@@ -2599,7 +2599,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         Node<K, V> victim = accessOrderProbationDeque().peekFirst();
         // 如果权重大小超过最大值，不断地执行驱逐策略，直到满足条件
         while (weightedSize() > maximum()) {
-            // 首次循环，如果候选驱逐区为空，表示在窗口区操作时 evictFromWindow 未将窗口区元素晋升到试用区
+            // 如果候选驱逐区为空且候选驱逐区为试用区，则指定候选驱逐区为窗口区
             if ((candidate == null) && (candidateQueue == PROBATION)) {
                 // 指定候选驱逐区为窗口区
                 candidate = accessOrderWindowDeque().peekFirst();
@@ -2732,14 +2732,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-元素的驱逐流程根据注释可以很清楚的了解，窗口区中元素会优先被晋升到试用区，在试用区和保护区中不断的驱逐节点知道满足条件，如果驱逐完成之后还不够则会从窗口区中驱逐元素，此外，使用随机驱逐的方式来减少 HASH DOS 攻击带来的影响也值得学习，更新原理图如下：
+元素的驱逐流程根据注释可以很清楚的了解，窗口区中元素会优先被晋升到试用区，在试用区和保护区中不断的驱逐节点直到满足条件，如果驱逐完成之后还不满足条件则会从窗口区中驱逐元素，此外，使用随机驱逐的方式来减少 HASH DOS 攻击带来的影响也值得学习，更新原理图如下：
 
 ![caffeine-第 4 页.drawio.png](caffeine-%E7%AC%AC%204%20%E9%A1%B5.drawio.png)
 
 #### climb
 
-那么，我们在这里假设，执行 `maintenance` 方法时其他处理写缓冲区方法等均无需特别处理，直接跳转到最后的 `climb`
-，看看它是如何为缓存“增值（climb）”的：
+现在我们来到了维护方法的最后一个步骤 `climb` 方法，看看它是如何为缓存“增值（climb）”的，源码如下：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -2836,9 +2835,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             }
             // 标记为试用区
             demoted.makeMainProbation();
-            // 加入到试用区中
+            // 加入到试用区尾节点
             accessOrderProbationDeque().offerLast(demoted);
-            // 计算保护区权重大小
+            // 计算变更后保护区权重大小
             mainProtectedWeightedSize -= demoted.getPolicyWeight();
         }
         // 更新保护区权重
@@ -2852,7 +2851,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             return;
         }
 
-        // 窗口调整的变化量由保护区贡献，取能够变化额度 quota 为计算调整量和保护区最大值中的小值
+        // 窗口调整的变化量由保护区贡献，取能够变化额度 quota 为 调整量adjustment 和 保护区最大值 中的小值
         long quota = Math.min(adjustment(), mainProtectedMaximum());
         // 减小保护区大小增加窗口区大小
         setMainProtectedMaximum(mainProtectedMaximum() - quota);
@@ -2860,11 +2859,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         // 保护区大小变动后，需要操作元素由保护区降级到试用区
         demoteFromMainProtected();
 
+        // 窗口区增加容量之后，需要优先从试用区获取元素将增加的容量填满，如果试用区元素不够，则从保护区获取元素来填
         for (int i = 0; i < QUEUE_TRANSFER_THRESHOLD; i++) {
             // 获取试用区头节点为“候选节点”
             Node<K, V> candidate = accessOrderProbationDeque().peekFirst();
             boolean probation = true;
-            // 如果在试用区获取失败或者窗口调整的变化量要比该节点所占的权重小，那么尝试从保护区获取节点
+            // 如果试用区元素为空或者窗口调整的变化量要比该节点所占的权重小，那么尝试从保护区获取节点
             if ((candidate == null) || (quota < candidate.getPolicyWeight())) {
                 candidate = accessOrderProtectedDeque().peekFirst();
                 probation = false;
@@ -2882,7 +2882,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
             // 每移除一个节点更新需要可变化额度
             quota -= weight;
-            // 如果是试用区节点，则直接移除
+            // 如果是试用区节点，则直接在试用区移除
             if (probation) {
                 accessOrderProbationDeque().remove(candidate);
             }
@@ -2954,6 +2954,10 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 }
 ```
+
+现在我们了解了 `climb` 方法的逻辑，正如它的注释所述 `Adapts the eviction policy to towards the optimal recency / frequency configuration.`，它会根据访问情况动态调整最佳的分区配置来适配驱逐策略。元素被添加时会优先被放在窗口区，窗口区越大则意味着短期内有大量缓存被添加，或被再次访问，缓存命中率提高，需要更大的窗口区支持，根据 `climb` 中的逻辑，窗口区增大会有试用区/保护区的元素不断被移动到窗口区；如果保护区越大意味着缓存中维护的元素都是访问频率较高的元素，命中率降低，并趋于某稳定值附近；试用区元素由窗口区元素晋升得来，再被访问时会被晋升到保护区，它更像是 JVM 分区的 survivor 区。缓冲区不同分区的动态调整可以适应不同的访问模式，优化缓存的性能。
+
+没有单纯的使用 LRU 或 LFU 缓存的原因
 
 ### 巨人的肩膀
 
