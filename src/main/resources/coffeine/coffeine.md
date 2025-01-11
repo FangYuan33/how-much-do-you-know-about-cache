@@ -222,8 +222,8 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         evictionListener = builder.getEvictionListener(isAsync);
         // 用于保存所有数据的 ConcurrentHashMap
         data = new ConcurrentHashMap<>(builder.getInitialCapacity());
-        // 如果指定驱逐策略 或 key为弱引用 或 value为弱引用 或 访问后过期则创建 readBuffer，否则它为不可用状态
-        // readBuffer 用于记录某些被访问过的节点，这些节点
+        // 如果指定驱逐策略 或 key为弱引用 或 value为弱引用或软引用 或 访问后过期则创建 readBuffer，否则它为不可用状态
+        // readBuffer 用于记录某些被访问过的节点
         readBuffer = evicts() || collectKeys() || collectValues() || expiresAfterAccess()
                 ? new BoundedBuffer<>() : Buffer.disabled();
         // 如果指定了驱逐策略 或 访问后过期策略则会定义访问策略，执行 onAccess 方法，后文详细介绍
@@ -713,7 +713,11 @@ abstract class BaseMpscLinkedArrayQueuePad1<E> extends AbstractQueue<E> {
 }
 ```
 
-这个类除了定义了 120 字节的字段外，看上去没有做其他任何事情，实际上它为 **性能提升** 默默做出了贡献，**避免了内存伪共享问题**。CPU 中缓存行（Cache Line）的大小通常是 64 字节，在类中定义 120 字节来占位，这样便能将上下继承关系间的字段间隔开，保证被多个线程访问的关键字段距离至少跨越一个缓存行，分布在不同的缓存行中。这样在不同的线程访问 `BaseMpscLinkedArrayQueueProducerFields` 和 `BaseMpscLinkedArrayQueueConsumerFields` 中字段时互不影响，详细了解原理可参考[博客园 - CPU Cache与缓存行](https://www.cnblogs.com/zhongqifeng/p/14765576.html)。
+这个类除了定义了 120 字节的字段外，看上去没有做其他任何事情，实际上它为 **性能提升** 默默做出了贡献，**避免了内存伪共享问题**。CPU 中缓存行（Cache Line）的大小通常是 64 字节，在类中定义 120 字节来占位，这样便能将上下继承关系间的字段间隔开，保证被多个线程访问的关键字段距离至少跨越一个缓存行，分布在不同的缓存行中。这样在不同的线程访问 `BaseMpscLinkedArrayQueueProducerFields` 和 `BaseMpscLinkedArrayQueueConsumerFields` 中字段时互不影响，
+
+补张图吧
+
+详细了解原理可参考[博客园 - CPU Cache与缓存行](https://www.cnblogs.com/zhongqifeng/p/14765576.html)。
 
 接下来我们看看其他抽象类的作用。`BaseMpscLinkedArrayQueueProducerFields` 定义生产者相关字段：
 
@@ -1062,12 +1066,12 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-可以发现在该方法中并没有限制单一线程执行，所以理论上这个方法可能被多个线程调用，那么它又为什么被称为 **MPSC** 呢？在这个方法的注释中有一段话值得细心体会：
+可以发现在该方法中并没有限制单一线程执行，所以理论上这个方法可能被多个线程调用，那么它又为什么被称为 **MPSC** 呢？在这个方法中的一段注释值得细心体会：
 
 > This implementation is correct for single consumer thread use only.
 > 此实现仅适用于单消费者线程使用
 
-所以，猜想调用该方法的一定是一个线程数大小固定为1的线程池，保证单线程调用，至于是不是如此，需要等到在后续的源码中验证了。
+所以，猜想调用该方法的可能是一个线程数大小固定为1的线程池，保证单线程调用，至于是不是如此，需要等到在后续的源码中验证了。
 
 到这里 `MpscGrowableArrayQueue` 中核心的逻辑已经讲解完了，现在我们回过头来再看一下队列扩容前后生产者和消费者是如何协同的？在扩容前，`consumerBuffer` 和 `producerBuffer` 引用的是同一个缓冲区对象。如果发生扩容，那么生产者会创建一个新的缓冲区，并将 `producerBuffer` 引用指向它，此时它做了一个 **非常巧妙** 的操作，将 **新缓冲区依然链接到旧缓冲区** 上，并将触发扩容的元素对应的旧缓冲区的索引处标记为 JUMP，表示这及之后的元素已经都在新缓冲区中。此时，消费者依然会在旧缓冲区中慢慢地消费，直到遇到 JUMP 标志位，消费者就知道需要到新缓冲区中取获取元素了。因为之前生产者在扩容时对新旧缓冲区进行链接，所以消费者能够通过旧缓冲区获取到新缓冲区的引用，并变更 `consumerBuffer` 的引用和 `consumerMask` 掩码值，接下来的消费过程便和扩容前没有差别了。
 
@@ -1890,6 +1894,30 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 ### getIfPresent
 
+现在我们对 `put` 方法有了基本了解，现在我们继续深入 `getIfPresent` 方法：
+
+```java
+public class TestReadSourceCode {
+
+    @Test
+    public void doRead() {
+        // read constructor
+        Cache<String, String> cache = Caffeine.newBuilder()
+                .maximumSize(10_000)
+                .build();
+
+        // read put
+        cache.put("key", "value");
+
+        // read get
+        cache.getIfPresent("key");
+    }
+
+}
+```
+
+对应源码如下，关注注释信息：
+
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
 
@@ -1908,6 +1936,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             }
             // 当前 drainStatus 为 REQUIRED 表示有任务需要处理则调度处理
             if (drainStatusOpaque() == REQUIRED) {
+                // 这个方法在上文中介绍过，它会提交 PerformCleanupTask 执行维护方法 maintenance
                 scheduleDrainBuffers();
             }
             return null;
@@ -1934,11 +1963,20 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             // 更新读后过期时间
             tryExpireAfterRead(node, castedKey, value, expiry(), now);
         }
-        // 处理读取后操作
+        // 处理读取后操作（主要关注）
         V refreshed = afterRead(node, now, recordStats);
         return (refreshed == null) ? value : refreshed;
     }
+}
+```
 
+`getIfPresent` 方法中，部分内容我们已经在上文中介绍过，比如 `scheduleDrainBuffers` 方法。最后一步 `afterRead` 方法是我们本次关注的重点，从命名来看它表示“读后操作”接下来看看它的具体流程：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
+
+    final Buffer<Node<K, V>> readBuffer;
+    
     @Nullable
     V afterRead(Node<K, V> node, long now, boolean recordHit) {
         // 更新统计命中
@@ -1946,15 +1984,20 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             statsCounter().recordHits(1);
         }
 
-        // 注意这里如果 readBuffer 已经被初始化不需要被跳过，它会执行 readBuffer.offer(node) 逻辑，添加待处理元素
-        // 没有满的话为 true
+        // 注意这里如果 skipReadBuffer 为false，那么它会执行 readBuffer.offer(node) 逻辑，向 ReadBuffer 中添加待处理元素
         boolean delayable = skipReadBuffer() || (readBuffer.offer(node) != Buffer.FULL);
-        // 判断是否需要处理维护任务
+        // 判断是否需要延迟处理维护任务
         if (shouldDrainBuffers(delayable)) {
             scheduleDrainBuffers();
         }
         // 处理必要的刷新操作
         return refreshIfNeeded(node, now);
+    }
+
+    boolean skipReadBuffer() {
+        // fastpath 方法访问元素是否可以跳过“通知”驱逐策略，true 表示跳过
+        // 第二个判断条件判断频率草图是否初始化，如果“未初始化”则返回 true
+        return fastpath() && frequencySketch().isNotInitialized();
     }
 
     // 状态流转，没有满 delayable 为 true 表示延迟执行维护任务
@@ -1971,6 +2014,287 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             default:
                 throw new IllegalStateException("Invalid drain status: " + drainStatus);
         }
+    }
+}
+```
+
+在深入具体源码前，我们还是先来介绍数据结构 `ReadBuffer`，它在 caffeine 的构造方法中完成初始化：
+
+```java
+abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
+        implements LocalCache<K, V> {
+
+    final Buffer<Node<K, V>> readBuffer;
+    
+    protected BoundedLocalCache(Caffeine<K, V> builder,
+                                @Nullable AsyncCacheLoader<K, V> cacheLoader, boolean isAsync) {
+        // ...
+        
+        // 如果指定了过期策略或 key 定义了 week refenence value 定义了 week or soft reference 或定义了访问后过期策略 则 创建 BoundBuffer
+        readBuffer = evicts() || collectKeys() || collectValues() || expiresAfterAccess()
+                ? new BoundedBuffer<>()
+                : Buffer.disabled();
+    }
+}
+```
+
+`Buffer.disabled()` 会创建如下枚举来表示 `DisabledBuffer`:
+
+```java
+enum DisabledBuffer implements Buffer<Object> {
+    INSTANCE;
+
+    @Override
+    public int offer(Object e) {
+        return Buffer.SUCCESS;
+    }
+
+    @Override
+    public void drainTo(Consumer<Object> consumer) {
+    }
+
+    @Override
+    public long size() {
+        return 0;
+    }
+
+    @Override
+    public long reads() {
+        return 0;
+    }
+
+    @Override
+    public long writes() {
+        return 0;
+    }
+}
+```
+
+`readBuffer` 的实际类型为 `BoundedBuffer`，它的类关系图如下：
+
+
+在 `Buffer` 接口的注释声明中，能获取很多有效信息：它同样也是 **多生产者单消费者（MPSC）** 缓冲区，上文我们在介绍`WriteBuffer` 时，它的单消费者实现方式是加同步锁，`ReadBuffer` 的实现方式一样，因为它们都是在维护方法 `maintenance` 中加同步锁对元素进行消费。此外，如果 `ReadBuffer` 缓冲区满了或者发生争抢则会拒绝添加新元素，它不像队列或栈，不保证 FIFO 或 LIFO。因为实现中不保证多消费者情况下正常，所以调用者需要保证消费者对该缓存的独占权。
+
+> A multiple-producer / single-consumer buffer that rejects new elements if it is full or fails spuriously due to contention. Unlike a queue and stack, a buffer does not guarantee an ordering of elements in either FIFO or LIFO order.
+Beware that it is the responsibility of the caller to ensure that a consumer has exclusive read access to the buffer. This implementation does not include fail-fast behavior to guard against incorrect consumer usage.
+
+抽象类 `StripedBuffer` 采用分段设计（Striped）和CAS操作实现高效并发写入。分段是将缓冲区分成多个“段”，根据线程的探针值将它们哈希到不同的“段”，减少竞争，接下来我们看一下它具体的实现逻辑，首先是 `offer` 方法：
+
+```java
+abstract class StripedBuffer<E> implements Buffer<E> {
+
+    volatile Buffer<E> @Nullable[] table;
+    
+    @Override
+    public int offer(E e) {
+        // 扰动函数计算 64位 线程探针值
+        long z = mix64(Thread.currentThread().getId());
+        // 取高 32 位值，位或 1 保证它为奇数
+        int increment = ((int) (z >>> 32)) | 1;
+        // 转换为 int 32 位
+        int h = (int) z;
+
+        // 掩码值为已分段的缓冲区数量-1
+        int mask;
+        int result;
+        // 线程哈希到的具体缓冲区
+        Buffer<E> buffer;
+        // 未竞争标志位
+        boolean uncontended = true;
+        Buffer<E>[] buffers = table;
+        if ((buffers == null)
+                || ((mask = buffers.length - 1) < 0)
+                // 位与运算获取缓冲区
+                || ((buffer = buffers[h & mask]) == null)
+                // 向缓冲区中添加元素
+                || !(uncontended = ((result = buffer.offer(e)) != Buffer.FAILED))) {
+            // 扩容或重试操作
+            return expandOrRetry(e, h, increment, uncontended);
+        }
+        return result;
+    }
+}
+```
+
+在 `StripedBuffer` 中我们能发现定义了 `volatile Buffer<E> @Nullable[] table` 是数组的形式，这便对应了它“分段”的思想，将元素保存在多个缓冲区中。通过线程探针值哈希获取对应的缓冲区，逻辑并不复杂。`expandOrRetry` 方法我们稍后再介绍，我们先假设线程哈希到的具体缓冲区 `Buffer<E> buffer` 对象已经被创建，那么它会执行 `buffer.offer(e)`。`Buffer<E> buffer` 对应的实现类是定义在 `BoundedBuffer` 的静态内部类 `RingBuffer`，它实现了 `Buffer` 接口，源码如下：
+
+```java
+final class BoundedBuffer<E> extends StripedBuffer<E> {
+
+    static final int BUFFER_SIZE = 16;
+    static final int MASK = BUFFER_SIZE - 1;
+    
+    static final class RingBuffer<E> extends BBHeader.ReadAndWriteCounterRef implements Buffer<E> {
+        static final VarHandle BUFFER = MethodHandles.arrayElementVarHandle(Object[].class);
+
+        final Object[] buffer;
+
+        public RingBuffer(E e) {
+            buffer = new Object[BUFFER_SIZE];
+            BUFFER.set(buffer, 0, e);
+            WRITE.set(this, 1);
+        }
+
+        @Override
+        public int offer(E e) {
+            // ReadCounterRef#readCounter
+            long head = readCounter;
+            // ReadAndWriteCounterRef#writeCounter
+            long tail = writeCounterOpaque();
+            // 计算可操作容量 size
+            long size = (tail - head);
+            // 超过缓存大小则证明它已经满了
+            if (size >= BUFFER_SIZE) {
+                return Buffer.FULL;
+            }
+            // CAS 更新 writeCounter 为 writeCounter+1
+            if (casWriteCounter(tail, tail + 1)) {
+                // 位与掩码值获取缓冲区中的索引
+                int index = (int) (tail & MASK);
+                // 将元素 e 更新在指定索引处
+                BUFFER.setRelease(buffer, index, e);
+                return Buffer.SUCCESS;
+            }
+            return Buffer.FAILED;
+        }
+
+        @Override
+        public void drainTo(Consumer<E> consumer) {
+            // ReadCounterRef#readCounter
+            long head = readCounter;
+            // ReadAndWriteCounterRef#writeCounter
+            long tail = writeCounterOpaque();
+            // 计算可操作容量 size
+            long size = (tail - head);
+            // size 为 0 表示无元素可操作
+            if (size == 0) {
+                return;
+            }
+            // 循环获取待消费元素
+            do {
+                // 计算具体的索引
+                int index = (int) (head & MASK);
+                @SuppressWarnings("unchecked")
+                E e = (E) BUFFER.getAcquire(buffer, index);
+                // 索引处元素为空表示无元素可消费
+                if (e == null) {
+                    break;
+                }
+                // 获取到具体元素后将缓冲区该元素位置更新成 null
+                BUFFER.setRelease(buffer, index, null);
+                // 执行消费逻辑
+                consumer.accept(e);
+                // head累加
+                head++;
+            } while (head != tail);
+            // 更新读索引的值
+            setReadCounterOpaque(head);
+        }
+    }
+}
+
+final class BBHeader {
+
+    @SuppressWarnings("PMD.AbstractClassWithoutAbstractMethod")
+    abstract static class PadReadCounter {
+        byte p000, /*省略118字节占位符...*/ p119;
+    }
+    
+    abstract static class ReadCounterRef extends PadReadCounter {
+        volatile long readCounter;
+    }
+
+    abstract static class PadWriteCounter extends ReadCounterRef {
+        byte p120, /*省略118字节占位符...*/ p239;
+    }
+    
+    abstract static class ReadAndWriteCounterRef extends PadWriteCounter {
+        static final VarHandle READ, WRITE;
+
+        volatile long writeCounter;
+
+        // ...
+    }
+}
+```
+
+在 `BBHeader` 类中又看到了熟悉的 120 字节内存占位，在上文中我们详细介绍过，这样能够保证 `readCounter` 和 `writeCounter` 分布在不同内存行，**避免了内存伪共享问题**，保证不同线程读取这两个字段时互不影响。在添加元素的 `offer` 方法和消费元素的 `drainTo` 方法中，都能看见它使用了“读索引readCounter”和“写索引writeCounter”，这也对应了它命名中的 **Ring**。**Ring** 表示环形，读、写索引在操作过程中会不断累加，但是它会执行位与运算保证索引值一直落在缓冲区长度的有效范围内，也就是说这两个索引值会不断在有效索引范围内“转圈”，则形成一个“环形”缓冲区。
+
+`RingBuffer` 通过 CAS 操作来确保并发添加元素操作的安全，如果 CAS 操作失败则返回 `Buffer.FAILED`，这时便会执行 `StripedBuffer#expandOrRetry` 方法，我们先来看一下它的方法注释内容，它说：
+
+> Handles cases of updates involving initialization, resizing, creating new Buffers, and/ or contention. See above for explanation. This method suffers the usual non-modularity problems of optimistic retry code, relying on rechecked sets of reads.
+
+```java
+abstract class StripedBuffer<E> implements Buffer<E> {
+    final int expandOrRetry(E e, int h, int increment, boolean wasUncontended) {
+        int result = Buffer.FAILED;
+        boolean collide = false; // True if last slot nonempty
+        for (int attempt = 0; attempt < ATTEMPTS; attempt++) {
+            Buffer<E>[] buffers;
+            Buffer<E> buffer;
+            int n;
+            if (((buffers = table) != null) && ((n = buffers.length) > 0)) {
+                if ((buffer = buffers[(n - 1) & h]) == null) {
+                    if ((tableBusy == 0) && casTableBusy()) { // Try to attach new Buffer
+                        boolean created = false;
+                        try { // Recheck under lock
+                            Buffer<E>[] rs;
+                            int mask, j;
+                            if (((rs = table) != null) && ((mask = rs.length) > 0)
+                                    && (rs[j = (mask - 1) & h] == null)) {
+                                rs[j] = create(e);
+                                created = true;
+                            }
+                        } finally {
+                            tableBusy = 0;
+                        }
+                        if (created) {
+                            result = Buffer.SUCCESS;
+                            break;
+                        }
+                        continue; // Slot is now non-empty
+                    }
+                    collide = false;
+                } else if (!wasUncontended) { // CAS already known to fail
+                    wasUncontended = true;      // Continue after rehash
+                } else if ((result = buffer.offer(e)) != Buffer.FAILED) {
+                    break;
+                } else if ((n >= MAXIMUM_TABLE_SIZE) || (table != buffers)) {
+                    collide = false; // At max size or stale
+                } else if (!collide) {
+                    collide = true;
+                } else if ((tableBusy == 0) && casTableBusy()) {
+                    try {
+                        if (table == buffers) { // Expand table unless stale
+                            table = Arrays.copyOf(buffers, n << 1);
+                        }
+                    } finally {
+                        tableBusy = 0;
+                    }
+                    collide = false;
+                    continue; // Retry with expanded table
+                }
+                h += increment;
+            } else if ((tableBusy == 0) && (table == buffers) && casTableBusy()) {
+                boolean init = false;
+                try { // Initialize table
+                    if (table == buffers) {
+                        @SuppressWarnings({"rawtypes", "unchecked"})
+                        Buffer<E>[] rs = new Buffer[1];
+                        rs[0] = create(e);
+                        table = rs;
+                        init = true;
+                    }
+                } finally {
+                    tableBusy = 0;
+                }
+                if (init) {
+                    result = Buffer.SUCCESS;
+                    break;
+                }
+            }
+        }
+        return result;
     }
 }
 ```
