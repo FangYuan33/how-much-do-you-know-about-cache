@@ -2493,7 +2493,11 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-简单概括来说：`ReadBuffer` 中所有的元素都会被执行 `onAccess` 的逻辑，频率草图会被更新，窗口区元素会被移动到该区的尾结点，试用区元素在满足条件的情况下会被晋升到保护区。在这个方法中有一段注释非常重要，它说：
+简单概括来说：`ReadBuffer` 中所有的元素都会被执行 `onAccess` 的逻辑，频率草图会被更新，窗口区元素会被移动到该区的尾结点，试用区元素在满足条件的情况下会被晋升到保护区。在原理图中补充 `ReadBuffer` 相关逻辑，相比于原有 `put` 方法的逻辑，`ReadBuffer` 的消费并没有引入特别“新颖”的内容：
+
+![caffeine-第 3 页.drawio.png](caffeine-%E7%AC%AC%203%20%E9%A1%B5.drawio.png)
+
+在 `onAccess` 方法中有一段注释比较有意思，它说：
 
 > If the protected space exceeds its maximum, the LRU items are demoted to the probation space.
 > This is deferred to the adaption phase at the end of the maintenance cycle.
@@ -2502,7 +2506,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 #### evictEntries
 
-
+`evictEntries` 驱逐元素
 
 #### climb
 
