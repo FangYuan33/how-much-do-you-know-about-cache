@@ -1,4 +1,7 @@
-我们先以简单的创建一个固定大小的缓存为例
+本文将采用“总-分-总”的结构对配置固定大小缓存驱逐策略的 Caffeine 缓存进行介绍，首先会讲解它的实现原理，在大家对它有一个概念之后再深入具体源码的细节之中，理解它的设计理念，从中能学习到很多关于高性能缓存设计的方法和多线程间协调的设计方案，最后会对全文内容进行总结，希望大家能有所收获的同时也能在未来进行缓存选型时提供完整的理论参考。
+
+
+
 
 ```java
 public class TestReadSourceCode {
@@ -22,8 +25,7 @@ public class TestReadSourceCode {
 
 ### constructor
 
-在 Caffeine 的构造方法中，区分了 `BoundedLocalManualCache` 和 `UnboundedLocalManualCache`
-，见名知意它们分别为有“边界”的和无“边界”的缓存，`isBounded` 方法诠释了“边界”的含义：
+Caffeine 的实现类区分了 `BoundedLocalManualCache` 和 `UnboundedLocalManualCache`，见名知意它们分别为“有边界”的和“无边界”的缓存。`Caffeine#isBounded` 方法诠释了“边界”的含义：
 
 ```java
 public final class Caffeine<K, V> {
@@ -53,11 +55,7 @@ public final class Caffeine<K, V> {
 }
 ```
 
-也就是说，当为缓存指定了上述的驱逐或过期策略会定义为有边界的 `BoundedLocalManualCache`
-缓存，它会限制缓存的大小，防止内存溢出，否则为无边界的 `UnboundedLocalManualCache`
-缓存，它没有大小限制，直到内存耗尽。
-
-接下来我们主要关注 `BoundedLocalManualCache`，它在执行构造方法时，有以下逻辑：
+也就是说，当为缓存指定了上述的驱逐或过期策略会定义为有边界的 `BoundedLocalManualCache` 缓存，它会限制缓存的大小，防止内存溢出，否则为无边界的 `UnboundedLocalManualCache` 类型，它没有大小限制，直到内存耗尽。我们以创建配置了固定大小的缓存为例，它对应的类型便是 `BoundedLocalManualCache`，在执行构造方法时，有以下逻辑：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
@@ -80,7 +78,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 }
 ```
 
-我们可以发现 `BoundedLocalCache` 为抽象类，创建对象的实际类型应该是它的子类，而且它在创建时，使用了反射并遵循简单工厂的编码风格：
+`BoundedLocalCache` 为抽象类，缓存对象的实际类型都是它的子类。它在创建时使用了反射并遵循简单工厂的编码风格：
 
 ```java
 interface LocalCacheFactory {
@@ -99,7 +97,7 @@ interface LocalCacheFactory {
 }
 ```
 
-`getClassName` 非常有意思，它会根据为缓存设置的一些属性动态的拼接出列名：
+`getClassName` 方法非常有意思，它会根据缓存配置的属性动态拼接出实际缓存类名：
 
 ```java
 interface LocalCacheFactory {
@@ -154,19 +152,19 @@ interface LocalCacheFactory {
 }
 ```
 
-这也就是为什么能在 `com.github.benmanes.caffeine.cache` 包路径下能发现很多类似 `SSMS` 只有简称命名的类（下图只截取部分，实际上有很多）：
+这也就是为什么能在 `com.github.benmanes.caffeine.cache` 包路径下能发现很多类似 `SSMS` 只有简称命名的类的原因（下图只截取部分，实际上有很多）：
 
 ![img.png](SSMS.png)
 
-根据代码，它的命名遵循如下格式 `S|W S|I [L] [S] [MW|MS] [A] [W] [R]` 其中 `[]` 表示选填 `|`
-为某位置不同选择的分隔符，结合注释能清楚的了解各个位置字母表达的含义。如此定义使用了多级继承，尽可能多地复用代码，以我们测试用例中创建的 `SSMS`
-为例，它表示 key 和 value 均为强引用并且配置了非权重的最大缓存大小，类图关系如下：
+根据代码逻辑，它的命名遵循如下格式 `S|W S|I [L] [S] [MW|MS] [A] [W] [R]` 其中 `[]` 表示选填，`|` 表示某配置不同选择的分隔符，结合注释能清楚的了解各个位置字母简称表达的含义。如此定义实现类使用了 **多级继承**，尽可能多地复用代码。
+
+以我们测试用例中创建的缓存类型为例，它对应的实现类为 `SSMS`，表示 key 和 value 均为强引用，并配置了非权重的最大缓存大小限制，类图关系如下：
 
 ![img.png](SSMS.drawio.png)
 
-虽然在一些软件设计相关的书籍中强调“多用组合，少用继承”，但是这里使用多级继承我觉得并没有增加开发者的理解难度，反而了解了它的命名规则后，能更清晰的理解各个缓存所表示的含义，实现代码复用。
+虽然在一些软件设计相关的书籍中强调“多用组合，少用继承”，但是这里使用多级继承我觉得并没有增加开发者的理解难度，反而了解了它的命名规则后，能更清晰的理解各个缓存所表示的含义，更好地实现代码复用。
 
-测试样例创建的缓存类型为 `SSMS`，它的构造方法会依次执行如下逻辑：
+执行 `SSMS` 的构造方法会有以下逻辑：
 
 ```java
 // 1
@@ -227,8 +225,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         readBuffer = evicts() || collectKeys() || collectValues() || expiresAfterAccess()
                 ? new BoundedBuffer<>() : Buffer.disabled();
         // 如果指定了驱逐策略 或 访问后过期策略则会定义访问策略，执行 onAccess 方法，后文详细介绍
-        accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {
-        };
+        accessPolicy = (evicts() || expiresAfterAccess()) ? this::onAccess : e -> {};
         // 初始化最大值和最小值的双端队列作为 writeBuffer，用于记录一些写后操作任务 
         writeBuffer = new MpscGrowableArrayQueue<>(WRITE_BUFFER_MIN, WRITE_BUFFER_MAX);
 
@@ -262,7 +259,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
         setMissesInSample(0);
         setStepSize(-HILL_CLIMBER_STEP_PERCENT * max);
 
-        // 直到当前缓存的权重（大小）接近最大值时才初始化频率草图
+        // 直到当前缓存的权重（大小）接近最大值一半时才初始化频率草图
         if ((frequencySketch() != null) && !isWeighted() && (weightedSize() >= (max >>> 1))) {
             frequencySketch().ensureCapacity(max);
         }
@@ -291,7 +288,7 @@ class SSMS<K, V> extends SS<K, V> {
 
     SSMS(Caffeine<K, V> var1, @Nullable AsyncCacheLoader<? super K, V> var2, boolean var3) {
         super(var1, var2, var3);
-        // 如果 caffeine 初始化了容量则确定频率草图的容量
+        // 如果 Caffeine 初始化了容量则确定频率草图的容量
         if (var1.hasInitialCapacity()) {
             long var4 = Math.min(var1.getMaximum(), (long) var1.getInitialCapacity());
             this.sketch.ensureCapacity(var4);
@@ -305,9 +302,7 @@ class SSMS<K, V> extends SS<K, V> {
 }
 ```
 
-在步骤 1 中我们需要解释一下 `weightedSize()` 方法，它用于访问 `long weightedSize`
-变量。根据其命名有“权重大小”的含义，在默认不指定权重计算对象 `Weigher` 的情况下，`Weigher`
-默认为 `SingletonWeigher.INSTANCE` 表示每个元素的权重大小为 1，如下：
+在步骤 1 中我们需要解释一下 `weightedSize()` 方法，它用于访问 `long weightedSize` 变量。根据其命名有“权重大小”的含义，在默认不指定权重计算对象 `Weigher` 的情况下，`Weigher` 默认为 `SingletonWeigher.INSTANCE` 表示每个元素的权重大小为 1，如下：
 
 ```java
 enum SingletonWeigher implements Weigher<Object, Object> {
@@ -320,12 +315,10 @@ enum SingletonWeigher implements Weigher<Object, Object> {
 }
 ```
 
-这样 `weightedSize` 表示的便是当前缓存中元素数量，如果自定义了 `Weigher` 那么 `weightedSize`
-表示的便是缓存中总权重大小，每个元素的权重则可能会不同。因为在示例中我们并没有指定 `Weigher`
-，所以在此处可以将 `weightedSize` 理解为当前缓存大小。
+这样 `weightedSize` 表示的便是当前缓存中元素数量。如果自定义了 `Weigher` 那么 `weightedSize` 表示的便是缓存中总权重大小，每个元素的权重则可能会不同。因为在示例中我们并没有指定 `Weigher`，所以在此处可以将 `weightedSize` 理解为当前缓存大小。
 
-还有一个点需要注意，上文中我们提到缓存的定义遵循大写字母缩写的命名规则，节点类的定义也是用了这种方式，在创建节点工厂 `NodeFactory.newFactory(builder, isAsync)`
-的逻辑中，它会执行如下逻辑，根据缓存的类型来确定它的节点类型，命名遵循 `P|F S|W|D A|AW|W| [R] [MW|MS]` 的规则，同样使用了反射，如下：
+上文中我们提到缓存的定义遵循大写字母缩写的命名规则，实际上节点类的定义也采用了这种方式，在创建节点工厂 `NodeFactory.newFactory(builder, isAsync)`
+的逻辑中，它会执行如下逻辑，根据缓存的类型来确定它的节点类型，命名遵循 `P|F S|W|D A|AW|W| [R] [MW|MS]` 的规则，同样使用了反射机制和简单工厂的编码风格，如下：
 
 ```java
 interface NodeFactory<K, V> {
@@ -399,12 +392,11 @@ interface NodeFactory<K, V> {
 }
 ```
 
-`SSMS` 类型缓存对应的节点类型为 `PSMS`。除此之外我们还需要具体介绍下 `FrequencySketch`，它在上述方法的步骤 3 中被创建。这个类使用 **Count-Min Sketch**
-算法计算某个元素的访问频率。它维护了一个 `long[] table` 一维数组，每个元素有 64 位，每 4 位作为一个计数器（这也就限定了最大频率为
-15），那么数组中每个槽位便是 16 个计数器。通过哈希函数取 4 个独立的计数值，将其中的最小值作为元素的访问频率。`table`
-的初始大小为缓存最大容量最接近的 2 的 n 次幂，并在计算哈希值时使用 `blockMask` 掩码来使哈希结果均匀分布，保证了获取元素访问频率的正确率为
-93.75%，达到空间与时间的平衡。它的实现原理和布隆过滤器类似，牺牲了部分准确性，但减少了占用内存的大小。如下图所示为计算元素 e
-的访问频率：
+`SSMS` 类型缓存对应的节点类型为 `PSMS`。
+
+#### FrequencySketch
+
+接下来，我们需要具体介绍下 `FrequencySketch`，它在上述构造方法的步骤 3 中被创建。这个类使用 **Count-Min Sketch** 算法统计某个元素的访问频率。它维护了一个 `long[] table` 一维数组，每个元素有 64 位，每 4 位作为一个计数器（这也就限定了最大频率为 15），那么数组中每个槽位便是 16 个计数器。通过哈希函数取 4 个独立的计数值，将其中的最小值作为元素的访问频率。`table` 的初始大小为缓存最大容量最接近的 2 的 n 次幂，并在计算哈希值时使用 `blockMask` 掩码来使哈希结果均匀分布，保证了获取元素访问频率的正确率为 93.75%，达到空间与时间的平衡。它的实现原理和布隆过滤器类似，牺牲了部分准确性，但减少了占用内存的大小。如下图所示为计算元素 e 的访问频率：
 
 ![frequencySketch.drawio.png](frequencySketch.drawio.png)
 
@@ -435,7 +427,7 @@ final class FrequencySketch<E> {
             return;
         }
 
-        // 初始化 table，长度为最接近 maximum 的 2的n次幂和 8 中的大值
+        // 初始化 table，长度为最接近 maximum 的 2的n次幂 和 8 中的大值
         table = new long[Math.max(Caffeine.ceilingPowerOfTwo(maximum), 8)];
         // 计算采样大小
         sampleSize = (maximumSize == 0) ? 10 : (10 * maximum);
@@ -1075,7 +1067,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 
 到这里 `MpscGrowableArrayQueue` 中核心的逻辑已经讲解完了，现在我们回过头来再看一下队列扩容前后生产者和消费者是如何协同的？在扩容前，`consumerBuffer` 和 `producerBuffer` 引用的是同一个缓冲区对象。如果发生扩容，那么生产者会创建一个新的缓冲区，并将 `producerBuffer` 引用指向它，此时它做了一个 **非常巧妙** 的操作，将 **新缓冲区依然链接到旧缓冲区** 上，并将触发扩容的元素对应的旧缓冲区的索引处标记为 JUMP，表示这及之后的元素已经都在新缓冲区中。此时，消费者依然会在旧缓冲区中慢慢地消费，直到遇到 JUMP 标志位，消费者就知道需要到新缓冲区中取获取元素了。因为之前生产者在扩容时对新旧缓冲区进行链接，所以消费者能够通过旧缓冲区获取到新缓冲区的引用，并变更 `consumerBuffer` 的引用和 `consumerMask` 掩码值，接下来的消费过程便和扩容前没有差别了。
 
-#### scheduleAfterWrite 方法
+#### scheduleAfterWrite
 
 现在我们再回到 `put` 方法的逻辑中，如果向 `WriterBuffer` 中添加元素成功，则会调用 `scheduleAfterWrite` 方法，调度任务的执行：
 
@@ -1886,7 +1878,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-`UpdateTask` 修改任务负责变更权重值，并更新节点所在队列的顺序和访问频率，这里我们也能发现，这三个区域的队列采用了 **LRU 算法**，一般情况下，**最新被访问的元素会被移动到尾节点**。到现在，向有固定容量限制的缓存中调用 `put` 方法添加元素的逻辑基本已经介绍完了，目前对 caffeine 缓存的了解程度如下所示：
+`UpdateTask` 修改任务负责变更权重值，并更新节点所在队列的顺序和访问频率，这里我们也能发现，这三个区域的队列采用了 **LRU 算法**，一般情况下，**最新被访问的元素会被移动到尾节点**。到现在，向有固定容量限制的缓存中调用 `put` 方法添加元素的逻辑基本已经介绍完了，目前对 Caffeine 缓存的了解程度如下所示：
 
 ![caffeine-第 2 页.drawio.png](caffeine-%E7%AC%AC%202%20%E9%A1%B5.drawio.png)
 
@@ -2018,7 +2010,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-该方法非常简单，都是熟悉的内容，只需要了解数据结构 `ReadBuffer`，它在 caffeine 的构造方法中完成初始化。
+该方法非常简单，都是熟悉的内容，只需要了解数据结构 `ReadBuffer`，它在 Caffeine 的构造方法中完成初始化。
 
 #### ReadBuffer
 
@@ -2955,7 +2947,9 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-现在我们了解了 `climb` 方法的逻辑，正如它的注释所述 `Adapts the eviction policy to towards the optimal recency / frequency configuration.`，它会根据访问情况动态调整最佳的分区配置来适配驱逐策略。元素被添加时会优先被放在窗口区，窗口区越大则意味着短期内有大量缓存被添加，或被再次访问，缓存命中率提高，需要更大的窗口区支持，根据 `climb` 中的逻辑，窗口区增大会有试用区/保护区的元素不断被移动到窗口区；如果保护区越大意味着缓存中维护的元素都是访问频率较高的元素，命中率降低，并趋于某稳定值附近；试用区元素由窗口区元素晋升得来，再被访问时会被晋升到保护区，它更像是 JVM 分区的 survivor 区。缓冲区不同分区的动态调整可以适应不同的访问模式，优化缓存的性能。
+现在我们了解了 `climb` 方法的逻辑，正如它的注释所述 `Adapts the eviction policy to towards the optimal recency / frequency configuration.`，它会根据访问情况动态调整最佳的分区配置以适应驱逐策略。元素被添加时会优先被放在窗口区，窗口区越大则意味着短期内有大量缓存被添加，或元素添加后被再次访问，缓存命中率提高，需要更大的窗口区来承接这部分新晋的元素。根据 `climb` 中的逻辑，窗口区增大也会有试用区/保护区的元素不断被移动到窗口区；如果保护区越大意味着缓存中维护的元素都是访问频率较高的元素，命中率降低，并趋于某稳定值附近；试用区元素由窗口区元素晋升得来，再被访问时会被晋升到保护区，它更像是 JVM 分区的 survivor 区。缓冲区不同分区的动态调整可以适应不同的访问模式，优化缓存的性能。接下来我们在原理图中补充上各个分区间元素的变换路径（元素也可由保护区直接降级到窗口区，但在图中未标出）：
+
+![caffeine-第 5 页.drawio.png](caffeine-%E7%AC%AC%205%20%E9%A1%B5.drawio.png)
 
 没有单纯的使用 LRU 或 LFU 缓存的原因
 
