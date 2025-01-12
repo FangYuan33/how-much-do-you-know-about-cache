@@ -1,7 +1,11 @@
-本文将采用“总-分-总”的结构对配置固定大小缓存驱逐策略的 Caffeine 缓存进行介绍，首先会讲解它的实现原理，在大家对它有一个概念之后再深入具体源码的细节之中，理解它的设计理念，从中能学习到很多关于高性能缓存设计的方法和多线程间协调的设计方案，最后会对全文内容进行总结，希望大家能有所收获的同时也能在未来进行缓存选型时提供完整的理论参考。
+本文将采用“总-分-总”的结构对配置固定大小元素驱逐策略的 Caffeine 缓存进行介绍，首先会讲解它的实现原理，在大家对它有一个概念之后再深入具体源码的细节之中，理解它的设计理念，从中能学习到用于统计元素访问频率的 Count-Min Sketch 算法、理解内存屏障和如何避免缓存伪共享问题、MPCS 多线程设计模式的实现、高性能缓存设计的方法和多线程间协调的设计方案等等，文章最后会对全文内容进行总结，希望大家能有所收获的同时能在未来对本地缓存选型时提供完整的理论参考。
+
+Caffeine 缓存原理图如下：
+
+![caffeine-第 5 页.drawio.png](caffeine-%E7%AC%AC%205%20%E9%A1%B5.drawio.png)
 
 
-
+接下来的源码分析以如下测试用例为例：先分析构造方法，了解缓存初始化过程中创建的重要数据结构和关键字段，然后再深入添加元素的方法（put），该方法相对复杂，也是 Caffeine 缓存的核心，理解了这部分内容，文章剩余的内容理解起来会非常容易，最后分析获取元素的方法（getIfPresent），这样便基本理解了 Caffeine 缓存的运行原理，需要注意的是，因为我们并未指定缓存元素的过期时间，所以与此相关的内容如时间过期策略和时间轮等内容不会专门介绍。
 
 ```java
 public class TestReadSourceCode {
@@ -548,7 +552,7 @@ final class FrequencySketch<E> {
 
 ### put
 
-接下来我们需要了解一下，向缓存中添加不存在的元素流程，如下为 Caffeine 的 `put` 方法：
+接下来继续了解向缓存中添加元素的流程，本节内容比较多，理解起来也相对复杂，结合文章内容的同时，也需要多去深入查看 Caffeine 源码才能有更好的理解，以下为 `put` 方法的源码：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -589,7 +593,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         int newWeight = weigher.weigh(key, value);
         // 创建用于查找的键对象
         Object lookupKey = nodeFactory.newLookupKey(key);
-        // 无限循环
+        
         for (int attempts = 1; ; attempts++) {
             // 尝试获取节点；prior 译为先前的；较早的
             Node<K, V> prior = data.get(lookupKey);
@@ -606,20 +610,21 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
                 prior = data.putIfAbsent(node.getKeyReference(), node);
                 // 返回 null 表示插入成功
                 if (prior == null) {
-                    // 写操作后添加 AddTask 并调度执行任务
+                    // 写后操作：添加 AddTask 并调度执行任务
                     afterWrite(new AddTask(node, newWeight));
                     return null;
                 }
-                // onlyIfAbsent 在默认的 put 方法中为 false，以下逻辑简单介绍
+                // onlyIfAbsent 形参在默认的 put 方法中为 false，以下逻辑简单介绍
                 // 如果此时有其他线程添加了相同 key 的元素
                 else if (onlyIfAbsent) {
-                    // 获取到当前值，尝试判断读后失效策略，更新访问时间，并执行写后方法 afterRead
+                    // 获取到当前值，尝试判断读后失效策略，更新访问时间，并执行读后操作 afterRead 方法
                     V currentValue = prior.getValue();
                     if ((currentValue != null) && !hasExpired(prior, now)) {
                         if (!isComputingAsync(prior)) {
                             tryExpireAfterRead(prior, key, currentValue, expiry(), now);
                             setAccessTime(prior, now);
                         }
+                        // 读后操作，该方法在 getIfPresent 中进行讲解
                         afterRead(prior, now, /* recordHit */ false);
                         return currentValue;
                     }
@@ -642,7 +647,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-注意添加节点成功的逻辑，添加成功会添加 `AddTask` 任务到 `writeBuffer` 中：
+注意添加节点成功的逻辑，它会执行 `afterWrite` 写后操作方法，添加 `AddTask` 任务到 `writeBuffer` 中：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -674,16 +679,17 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-`writeBuffer` 的类型为 `MpscGrowableArrayQueue`，在这里我们详细的介绍下它。根据它的命名 **GrowableArrayQueue**
-可知它是一个容量可以增长的双端队列，前缀 **MPSC** 表达的含义是“多生产者，单消费者”，也就是说可以有多个线程能向其中添加元素，但只有一个线程能从其中获取元素。那么它是如何实现 **MPSC** 的呢？接下来我们就根据源码详细了解一下。
+`writeBuffer` 的类型为 `MpscGrowableArrayQueue`，在这里我们详细的介绍下它。
 
 #### MpscGrowableArrayQueue
 
-首先我们先来看一下它的类继承关系图及简要说明：
+根据它的命名 **GrowableArrayQueue** 可知它是一个容量可以增长的双端队列，前缀 **MPSC** 表达的含义是“多生产者，单消费者”，也就是说可以有多个线程向其中添加元素，但只有一个线程能从其中获取元素。那么它是如何实现 **MPSC** 的呢？接下来我们就根据源码详细了解一下。首先先来看一下它的类继承关系图及简要说明：
 
 ![WriteBuffer.drawio.png](WriteBuffer.drawio.png)
 
-图中灰色的表示抽象类，蓝色为实现类，`java.util.AbstractQueue` 就不再多解释了。首先我们先看看其中标记红框的内容：“避免内存伪共享问题”。以 `BaseMpscLinkedArrayQueuePad1` 为例：
+图中灰色的表示抽象类，蓝色为实现类，`java.util.AbstractQueue` 就不再多解释了。我们先看看其中标记红框的类，讨论到底什么是“避免内存伪共享问题”？
+
+以 `BaseMpscLinkedArrayQueuePad1` 为例：
 
 ```java
 abstract class BaseMpscLinkedArrayQueuePad1<E> extends AbstractQueue<E> {
@@ -705,11 +711,7 @@ abstract class BaseMpscLinkedArrayQueuePad1<E> extends AbstractQueue<E> {
 }
 ```
 
-这个类除了定义了 120 字节的字段外，看上去没有做其他任何事情，实际上它为 **性能提升** 默默做出了贡献，**避免了内存伪共享问题**。CPU 中缓存行（Cache Line）的大小通常是 64 字节，在类中定义 120 字节来占位，这样便能将上下继承关系间的字段间隔开，保证被多个线程访问的关键字段距离至少跨越一个缓存行，分布在不同的缓存行中。这样在不同的线程访问 `BaseMpscLinkedArrayQueueProducerFields` 和 `BaseMpscLinkedArrayQueueConsumerFields` 中字段时互不影响，
-
-补张图吧
-
-详细了解原理可参考[博客园 - CPU Cache与缓存行](https://www.cnblogs.com/zhongqifeng/p/14765576.html)。
+这个类除了定义了 120 字节的字段外，看上去没有做其他任何事情，实际上它为 **性能提升** 默默做出了贡献，**避免了内存伪共享**。CPU 中缓存行（Cache Line）的大小通常是 64 字节，在类中定义 120 字节来占位，这样便能将上下继承关系间的字段间隔开，保证被多个线程访问的关键字段距离至少跨越一个缓存行，分布在不同的缓存行中。这样在不同的线程访问 `BaseMpscLinkedArrayQueueProducerFields` 和 `BaseMpscLinkedArrayQueueConsumerFields` 中字段时互不影响，详细了解原理可参考[博客园 - CPU Cache与缓存行](https://www.cnblogs.com/zhongqifeng/p/14765576.html)。
 
 接下来我们看看其他抽象类的作用。`BaseMpscLinkedArrayQueueProducerFields` 定义生产者相关字段：
 
@@ -812,7 +814,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-现在 `MpscGrowableArrayQueue` 的构建已经看完了，了解了其中关键字段的赋值，现在我们就需要看它是如何实现 **MPSC** 的。“多生产者”也就意味着会有多个线程向其中添加元素，添加操作对应了 `BaseMpscLinkedArrayQueue#offer` 方法，它的实现如下，在看源码的过程中，需要思考它是如何在多线程间完成协同的：
+现在 `MpscGrowableArrayQueue` 的构建已经看完了，了解了其中关键字段的赋值，现在我们就需要看它是如何实现 **MPSC** 的。“多生产者”也就意味着会有多个线程向其中添加元素，既然是多线程就需要重点关注它是如何在多线程间完成协同的。添加操作对应了 `BaseMpscLinkedArrayQueue#offer` 方法，它的实现如下：
 
 ```java
 abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
@@ -947,7 +949,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-可见，在这个过程中它并没有限制操作线程数量，并通过保证 **可见性** 和使用 **CAS 操作** 允许多线程同时添加元素，可见性保证和CAS操作源码如下：
+可见，在这个过程中它并没有限制操作线程数量，也没有使用加锁的同步机制。它通过保证 **可见性**，并使用 **自旋锁结合 CAS 操作** 更新生产者索引值，因为该操作是原子的，同时只有一个线程能更新获取索引值成功，更新失败的线程会自旋重试，这样便允许多线程同时添加元素，可见性保证和CAS操作源码如下：
 
 ```java
 abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
@@ -967,7 +969,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 }
 ```
 
-保证可见性（内存操作对其他线程可见）的原理是 **内存屏障**，除了保证可见性以外，内存屏障还能够 **防止重排序**（确保在内存屏障前后的内存操作不会被重排序，从而保证程序的正确性）。到这里，生产者添加元素的逻辑我们已经分析完了，接下来我们需要继续看一下消费者取出元素的逻辑，它对应了  `BaseMpscLinkedArrayQueue#poll` 方法，同样地，在这过程中需要关注“在这个方法中有没有限制单一线程执行”：
+保证可见性（内存操作对其他线程可见）的原理是 **内存屏障**，除了保证可见性以外，内存屏障还能够 **防止重排序**（确保在内存屏障前后的内存操作不会被重排序，从而保证程序的正确性）。到这里，生产者添加元素的逻辑我们已经分析完了，接下来我们需要继续看一下消费者获取元素的逻辑，它对应了  `BaseMpscLinkedArrayQueue#poll` 方法，同样地，在这过程中需要关注“在这个方法中有没有限制单一线程执行”，以此实现单消费者呢：
 
 ```java
 abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdProducerFields<E> {
@@ -1063,7 +1065,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 > This implementation is correct for single consumer thread use only.
 > 此实现仅适用于单消费者线程使用
 
-所以，猜想调用该方法的可能是一个线程数大小固定为1的线程池，保证单线程调用，至于是不是如此，需要等到在后续的源码中验证了。
+所以调用该方法时开发者本身需要保证单线程调用而并不是在实现中控制。
 
 到这里 `MpscGrowableArrayQueue` 中核心的逻辑已经讲解完了，现在我们回过头来再看一下队列扩容前后生产者和消费者是如何协同的？在扩容前，`consumerBuffer` 和 `producerBuffer` 引用的是同一个缓冲区对象。如果发生扩容，那么生产者会创建一个新的缓冲区，并将 `producerBuffer` 引用指向它，此时它做了一个 **非常巧妙** 的操作，将 **新缓冲区依然链接到旧缓冲区** 上，并将触发扩容的元素对应的旧缓冲区的索引处标记为 JUMP，表示这及之后的元素已经都在新缓冲区中。此时，消费者依然会在旧缓冲区中慢慢地消费，直到遇到 JUMP 标志位，消费者就知道需要到新缓冲区中取获取元素了。因为之前生产者在扩容时对新旧缓冲区进行链接，所以消费者能够通过旧缓冲区获取到新缓冲区的引用，并变更 `consumerBuffer` 的引用和 `consumerMask` 掩码值，接下来的消费过程便和扩容前没有差别了。
 
@@ -1240,7 +1242,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-注意在执行 `performCleanUp` 方法时，也需要获取到同步锁 `evictionLock`，那么任务的提交和任务的执行也是互斥的。这个执行的核心逻辑在 `maintenance` “维护”方法中，注意这个方法被标记了注解 `@GuardedBy("evictionLock")`，源码中还有多个方法也标记了该注解，执行这些方法时都要获取同步锁，这也是在提醒我们这些方法同时只有由一条线程被执行。因为目前关注的是 `put` 方法，所以重点先看维护方法中 `drainWriteBuffer` 方法处理写缓冲区中的任务：
+注意在执行 `performCleanUp` 方法时，也需要获取到同步锁 `evictionLock`，那么任务的提交和任务的执行也是互斥的。这个执行的核心逻辑在 `maintenance` “维护”方法中，注意这个方法被标记了注解 `@GuardedBy("evictionLock")`，源码中还有多个方法也标记了该注解，执行这些方法时都要获取同步锁，这也是在提醒我们这些方法同时只有由一条线程被执行。因为目前关注的是 `put` 方法，所以重点先看维护方法中 `drainWriteBuffer` 方法处理写缓冲区中任务的逻辑：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -1267,9 +1269,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-执行逻辑非常简单，在获取到同步锁之后，在 `WriteBuffer` 中获取要被执行的任务并执行。上文中我们猜想“单消费者”的实现是由固定大小为 1 的线程池来保证的，但实际上使用的是 **同步锁的机制保证同时只能有一个消费者消费缓冲区中的任务**。
-
-在上文中我们已经知道，调用 `put` 方法时向缓冲区 `WriteBuffer` 中添加的任务为 `AddTask`，下面我们看一下该任务的实现：
+执行逻辑非常简单，在获取到同步锁之后，在 `WriteBuffer` 中获取要被执行的任务并执行。在这里我们能发现“SC 单消费者”的实现使用 **同步锁的机制保证同时只能有一个消费者消费缓冲区中的任务**。在上文中我们已经知道，调用 `put` 方法时向缓冲区 `WriteBuffer` 中添加的任务为 `AddTask`，下面我们看一下该任务的实现：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implements LocalCache<K, V> {
@@ -1501,7 +1501,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-该方法比较简单，是将节点进行驱逐的逻辑，对应 `AddTask` 任务的逻辑中，当被添加的元素权重超过最大权重限制时会被直接移除。这种特殊情况试用于指定了权重计算策略的缓存，如果只指定了固定容量，元素权重默认为 1，不会直接超过最大缓存数量限制。
+该方法比较简单，是将节点进行驱逐的逻辑，在后文中它会被多次复用，需要留一个印象。回到 `AddTask` 任务的逻辑中，当被添加的元素权重超过最大权重限制时会被直接移除。这种特殊情况试用于指定了权重计算策略的缓存，如果只指定了固定容量，元素权重默认为 1，所以不会直接超过最大缓存数量限制。
 
 现在我们已经将 `put` 方法中向缓存中添加元素的逻辑介绍完了，接下来需要关注 `put` 方法中对已存在的相同 key 值元素的处理逻辑：
 
@@ -1660,7 +1660,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
         }
 
         // 以下逻辑用于解决在重试了 100 次后仍然写入失败的问题，它会尝试获取 evictionLock 同步锁
-        // 直接执行“维护”方法并执行当前任务，但是它并无法解决某个写入操作执行时间很长的问题
+        // 直接同步执行“维护”方法并执行当前任务，但是它并无法解决某个写入操作执行时间很长的问题
         // 发生这种情况的原因可能是由于执行器的所有线程都很忙（可能是写入此缓存），写入速率大大超过了消耗速率，优先级反转，或者执行器默默地丢弃了维护任务
         lock();
         try {
@@ -1976,7 +1976,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
             statsCounter().recordHits(1);
         }
 
-        // 注意这里如果 skipReadBuffer 为false，那么它会执行 readBuffer.offer(node) 逻辑，向 ReadBuffer 中添加待处理元素
+        // 注意这里如果 skipReadBuffer 为 false，那么它会执行 readBuffer.offer(node) 逻辑，向 ReadBuffer 中添加待处理元素
         boolean delayable = skipReadBuffer() || (readBuffer.offer(node) != Buffer.FULL);
         // 判断是否需要延迟处理维护任务
         if (shouldDrainBuffers(delayable)) {
@@ -2010,9 +2010,11 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-该方法非常简单，都是熟悉的内容，只需要了解数据结构 `ReadBuffer`，它在 Caffeine 的构造方法中完成初始化。
+该方法非常简单，都是熟悉的内容，只有数据结构 `ReadBuffer` 还没深入了解过，它也是在 Caffeine 的构造方法中完成初始化的。
 
 #### ReadBuffer
+
+以下为 `ReadBuffer` 在 Caffeine 缓存中完成初始化的逻辑：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
@@ -2064,16 +2066,16 @@ enum DisabledBuffer implements Buffer<Object> {
 }
 ```
 
-`readBuffer` 的实际类型为 `BoundedBuffer`，它的类关系图如下：
+满足其中条件判断时，`ReadBuffer` 的实际类型为 `BoundedBuffer`，它的类关系图如下：
 
 ![BoundBuffer.drawio.png](BoundBuffer.drawio.png)
 
-在 `Buffer` 接口的注释声明中，能获取很多有效信息：它同样也是 **多生产者单消费者（MPSC）** 缓冲区，上文我们在介绍`WriteBuffer` 时，它的单消费者实现方式是加同步锁，`ReadBuffer` 的实现方式一样，因为它们都是在维护方法 `maintenance` 中加同步锁对元素进行消费。此外，如果 `ReadBuffer` 缓冲区满了或者发生争抢则会拒绝添加新元素，而且它不像队列或栈，**不保证 FIFO 或 LIFO**。因为实现中不保证多消费者情况下正常，所以调用者需要保证消费者对该缓存的独占权。
+在 `Buffer` 接口的注释声明中，能获取很多有效信息：它同样也是 **多生产者单消费者（MPSC）** 缓冲区，上文我们在介绍 `WriteBuffer` 时，它的单消费者实现方式是加同步锁，`ReadBuffer` 的实现单消费者的方式一样，因为它们都是在维护方法 `maintenance` 中加同步锁对元素进行消费。不同的是，如果 `ReadBuffer` 缓冲区满了或者发生争抢则会拒绝添加新元素，而且它不像队列或栈，**不保证 FIFO 或 LIFO**。
 
 > A multiple-producer / single-consumer buffer that rejects new elements if it is full or fails spuriously due to contention. Unlike a queue and stack, a buffer does not guarantee an ordering of elements in either FIFO or LIFO order.
 Beware that it is the responsibility of the caller to ensure that a consumer has exclusive read access to the buffer. This implementation does not include fail-fast behavior to guard against incorrect consumer usage.
 
-抽象类 `StripedBuffer` 采用分段设计（Striped）和CAS操作实现高效并发写入。分段是将缓冲区分成多个“段”，根据线程的探针值将它们哈希到不同的“段”，减少竞争，接下来我们看一下它具体的实现逻辑，首先是 `offer` 方法：
+在类关系图中，抽象类 `StripedBuffer` 的实现最值得学习，它采用了分段设计（Striped）和CAS操作实现高效并发写入。分段是将缓冲区分成多个“段”，根据线程的探针值将它们哈希到不同的“段”，减少竞争，接下来我们看一下它具体的实现逻辑，首先是 `StripedBuffer#offer` 方法：
 
 ```java
 abstract class StripedBuffer<E> implements Buffer<E> {
@@ -2111,7 +2113,7 @@ abstract class StripedBuffer<E> implements Buffer<E> {
 }
 ```
 
-在 `StripedBuffer` 中我们能发现定义了 `volatile Buffer<E> @Nullable[] table` 是数组的形式，这便对应了它“分段”的思想，将元素保存在多个缓冲区中。通过线程探针值哈希获取对应的缓冲区，逻辑并不复杂。`expandOrRetry` 方法我们稍后再介绍，我们先假设线程哈希到的具体缓冲区 `Buffer<E> buffer` 对象已经被创建，那么它会执行 `buffer.offer(e)`。`Buffer<E> buffer` 对应的实现类是定义在 `BoundedBuffer` 的静态内部类 `RingBuffer`，它实现了 `Buffer` 接口，源码如下：
+在 `StripedBuffer` 中我们能发现定义了 `volatile Buffer<E> @Nullable[] table` 是数组的形式，这便对应了它“分段”的思想，将元素保存在多个缓冲区中。通过线程探针值哈希获取对应的缓冲区，逻辑并不复杂。`expandOrRetry` 方法我们稍后再介绍，我们先假设线程哈希到的具体缓冲区 `Buffer<E> buffer` 对象已经被创建，那么它会执行 `buffer.offer(e)` 方法。`Buffer<E> buffer` 对应的实现类为定义在 `BoundedBuffer` 的静态内部类 `RingBuffer`，它也实现了 `Buffer` 接口，源码如下：
 
 ```java
 final class BoundedBuffer<E> extends StripedBuffer<E> {
@@ -2359,7 +2361,7 @@ abstract class StripedBuffer<E> implements Buffer<E> {
 }
 ```
 
-总结一下，`ReadBuffer` 是一个 MPSC 的缓冲区，采用了分段的思想和CAS操作来保证多线程写入操作高效执行。因为它没有记录元素的写入顺序，所以它并不会像栈或队列一样保证 FIFO 或 LIFO。随着写入竞争发生会不断对缓冲区数组扩容，每次扩容为原来大小的两倍，每个缓冲区为环形缓冲区，通过位与元素计算实际的索引，将被消费的元素标记为 null 实现元素中槽位的重用。
+总结一下，`ReadBuffer` 是一个 MPSC 的缓冲区，采用了分段的设计，将缓冲区划分为多份，根据线程的探针值哈希到不同的缓冲区，减少竞争的发生，并使用CAS操作来保证多线程下写入操作高效执行。因为它没有记录元素的写入顺序，所以它并不会像栈或队列一样保证 FIFO 或 LIFO。随着写入竞争发生会不断对缓冲区数组扩容，每次扩容为原来大小的两倍，每个缓冲区为环形缓冲区，通过位与运算计算元素实际的索引，将被消费的元素标记为 null 实现缓冲区中槽位的重用。
 
 现在读写方法已经了解差不多了，需要我们再次回到维护方法 `maintenance` 中，看一看消费读缓冲区和其他逻辑。
 
@@ -2489,7 +2491,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 
 ![caffeine-第 3 页.drawio.png](caffeine-%E7%AC%AC%203%20%E9%A1%B5.drawio.png)
 
-在 `reorderProbation` 方法中有一段注释比较有意思，它说：如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行，也就是后续我们会介绍的 `climb` 方法。
+在 `reorderProbation` 方法中有一段注释比较有意思，它说：如果保护区空间超过它的最大值，它会将其中的元素降级到试用区。但是这个操作被推迟到 `maintenance` 方法的最后执行，也就是后续我们会介绍的 `climb` 方法，相当于是对缓存元素的移动做了剧透。
 
 > If the protected space exceeds its maximum, the LRU items are demoted to the probation space.
 > This is deferred to the adaption phase at the end of the maintenance cycle.
@@ -2724,7 +2726,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-元素的驱逐流程根据注释可以很清楚的了解，窗口区中元素会优先被晋升到试用区，在试用区和保护区中不断的驱逐节点直到满足条件，如果驱逐完成之后还不满足条件则会从窗口区中驱逐元素，此外，使用随机驱逐的方式来减少 HASH DOS 攻击带来的影响也值得学习，更新原理图如下：
+方法虽然很长，但是逻辑清晰明了，元素的驱逐流程根据注释可以很明确的了解。窗口区中元素会优先被晋升到试用区，在试用区和保护区中不断的驱逐节点直到满足条件，如果驱逐完成之后还不满足条件则会从窗口区中驱逐元素，此外，在逻辑中使用随机驱逐的方式来减少 HASH DOS 攻击带来的影响也很值得学习，更新原理图如下：
 
 ![caffeine-第 4 页.drawio.png](caffeine-%E7%AC%AC%204%20%E9%A1%B5.drawio.png)
 
@@ -2947,11 +2949,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef implemen
 }
 ```
 
-现在我们了解了 `climb` 方法的逻辑，正如它的注释所述 `Adapts the eviction policy to towards the optimal recency / frequency configuration.`，它会根据访问情况动态调整最佳的分区配置以适应驱逐策略。元素被添加时会优先被放在窗口区，窗口区越大则意味着短期内有大量缓存被添加，或元素添加后被再次访问，缓存命中率提高，需要更大的窗口区来承接这部分新晋的元素。根据 `climb` 中的逻辑，窗口区增大也会有试用区/保护区的元素不断被移动到窗口区；如果保护区越大意味着缓存中维护的元素都是访问频率较高的元素，命中率降低，并趋于某稳定值附近；试用区元素由窗口区元素晋升得来，再被访问时会被晋升到保护区，它更像是 JVM 分区的 survivor 区。缓冲区不同分区的动态调整可以适应不同的访问模式，优化缓存的性能。接下来我们在原理图中补充上各个分区间元素的变换路径（元素也可由保护区直接降级到窗口区，但在图中未标出）：
+现在我们了解了 `climb` 方法的逻辑，正如它的注释所述 `Adapts the eviction policy to towards the optimal recency / frequency configuration.`，它会根据访问情况动态调整最佳的分区配置以适应驱逐策略。元素被添加时会优先被放在窗口区，窗口区越大则意味着短期内有大量缓存被添加，或元素添加后被再次访问，缓存命中率提高，需要更大的窗口区来承接这部分新晋的元素。根据 `climb` 中的逻辑，窗口区增大也会有试用区/保护区的元素不断被移动到窗口区；如果保护区越大意味着缓存中维护的元素都是访问频率较高的元素，命中率降低，并趋于某稳定值附近；试用区元素由窗口区元素晋升得来，再被访问时会被晋升到保护区，它更像是 JVM 分区的 survivor 区。缓冲区不同分区的动态调整可以适应不同的访问模式，优化缓存的性能。接下来我们在原理图中补充上各个分区间元素的变换路径（元素也可由保护区直接降级到窗口区，但在图中未标出），并根据图示对 Caffeine 的实现原理进行概括：
 
-![caffeine-第 5 页.drawio.png](caffeine-%E7%AC%AC%205%20%E9%A1%B5.drawio.png)
+![caffeine-第 6 页.drawio.png](caffeine-%E7%AC%AC%206%20%E9%A1%B5.drawio.png)
 
-没有单纯的使用 LRU 或 LFU 缓存的原因
+在图示（1）中了解到，`put` 方法会直接将元素添加到 `ConcurrentHashMap` 中，并在 `WriteBuffer` 中添加任务，由单线程调用维护方法对任务进行消费，元素访问频率会被更新，试用区元素可能会被晋升到保护区；在图示（2）调用 `getIfPresent` 方法会直接从 `ConcurrentHashMap` 中获取元素，并添加任务到 `ReadBuffer` 中由单线程消费，它相比于（1）并没有什么额外操作；图示（3）和图示（4）均发生在维护方法逻辑中，图示（3）驱逐元素时，窗口区元素会被“驱逐”到试用区，而试用区和保护区元素可能被直接驱逐；图示（4）“增值（climb）”操作会根据命中率调整窗口区和保护区的大小，合理分配分区间的元素。
+
+在文中提到过每个分区的双端队列使用了 LRU 算法，被访问过的元素会被放在尾节点，但对元素进行驱逐时并不以 LRU 的顺序为准，而是会参考频率草图中记录的元素频率，保证使用频率高的被保留，低的被驱逐。这和 LFU 算法很像，区别于 LFU 算法的是它采用了 Count-Min Sketch 算法来记录频率，能够在较小的内存开销下实现对频率较为精准（93.75%）的估计，这种算法实际被称为 **TinyLFU 算法**，它结合了两者的有点，在内存和计算开销上达到更好的平衡。
 
 ### 巨人的肩膀
 
