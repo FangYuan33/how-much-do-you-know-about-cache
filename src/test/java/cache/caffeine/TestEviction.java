@@ -68,11 +68,11 @@ public class TestEviction {
                 // 一个元素在上一次 读写 操作后一段时间之后，在指定的时间后没有被再次访问将会被认定为过期项
 //                .expireAfterAccess(5, TimeUnit.SECONDS)
                 //
-                .expireAfter(new Expiry<Object, Object>() {
+                .expireAfter(new Expiry<>() {
                     @Override
                     public long expireAfterCreate(Object key, Object value, long currentTime) {
                         // 指定过期时间为 Long.MAX_VALUE 则不会过期
-                        if  ("key0".equals(key)) {
+                        if ("key0".equals(key)) {
                             return Long.MAX_VALUE;
                         }
                         // 设置条目在创建后 5 秒过期
@@ -91,7 +91,7 @@ public class TestEviction {
                         return currentDuration;
                     }
                 })
-                // 该方法允许你配置缓存的过期条目在没有任何缓存活动时也能被及时清理，扫描周期在 caffeine 内部实现
+                // 该方法允许你配置缓存的过期元素在没有任何缓存活动时也能被及时清理，扫描周期在 caffeine 内部实现
                 .scheduler(Scheduler.forScheduledExecutorService(Executors.newScheduledThreadPool(1)))
                 .build();
 
