@@ -1,4 +1,4 @@
-在前文 [缓存之美：万文详解 Caffeine 实现原理]() 中，我们详细介绍了 Caffeine 缓存添加元素和读取元素的流程，并详细解析了配置固定大小元素驱逐策略的实现原理。在本文中我们将主要介绍 **配置元素过期时间策略的实现原理**，补全 Caffeine 对元素管理的机制。在创建有过期时间策略的 Caffeine 缓存时，它提供了三种不同的方法，分别为 `expireAfterAccess`, `expireAfterWrite` 和 `expireAfter`，前两者的元素过期机制非常简单：通过当前时间减去元素的最后访问时间（或写入时间）和配置的时间作对比，如果超过配置的时间，则认为元素过期。而 `expireAfter` 为自定义过期策略，使用到了时间轮 `TimeWheel`。它的实现相对复杂，在源码中相关的方法都会包含 **Variable** 命名（变量；可变的），如 `expiresVariable`。本文以如下源码创建自定义过期策略的缓存来了解 Caffeine 中的 `TimeWheel` 机制，它创建的缓存类型为 `SSA`，表示 Key 和 Value 均为强引用且配置了自定义过期策略：
+在前文 [缓存之美：万文详解 Caffeine 实现原理]() 中，我们详细介绍了 Caffeine 缓存添加元素和读取元素的流程，并详细解析了配置固定元素数量驱逐策略的实现原理。在本文中我们将主要介绍 **配置元素过期时间策略的实现原理**，补全 Caffeine 对元素管理的机制。在创建有过期时间策略的 Caffeine 缓存时，它提供了三种不同的方法，分别为 `expireAfterAccess`, `expireAfterWrite` 和 `expireAfter`，前两者的元素过期机制非常简单：通过遍历队列中的元素（`expireAfterAccess` 遍历的是窗口区、试用区和保护区队列，`expireAfterWrite` 有专用的写顺序队列 `WriteOrderDeque`），并用当前时间减去元素的最后访问时间（或写入时间）的结果值和配置的时间作对比，如果超过配置的时间，则认为元素过期。而 `expireAfter` 为自定义过期策略，使用到了时间轮 `TimeWheel`。它的实现相对复杂，在源码中相关的方法都会包含 **Variable** 命名（变量；可变的），如 `expiresVariable`。本文以如下源码创建自定义过期策略的缓存来了解 Caffeine 中的 `TimeWheel` 机制，它创建的缓存类型为 `SSA`，表示 Key 和 Value 均为强引用且配置了自定义过期策略：
 
 ```java
 public class TestReadSourceCode {
@@ -18,15 +18,13 @@ public class TestReadSourceCode {
                         return TimeUnit.SECONDS.toNanos(5);
                     }
 
+                    // 以下两个过期时间指定为默认 duration 不过期
                     @Override
                     public long expireAfterUpdate(Object key, Object value, long currentTime, @NonNegative long currentDuration) {
-                        // 默认过期策略
                         return currentDuration;
                     }
-
                     @Override
                     public long expireAfterRead(Object key, Object value, long currentTime, @NonNegative long currentDuration) {
-                        // 默认过期策略
                         return currentDuration;
                     }
                 })
@@ -44,7 +42,7 @@ public class TestReadSourceCode {
 }
 ```
 
-在前文中我们提到过，Caffeine 中 `maintenance` 负责维护缓存中的元素，我们便以这个方法作为起点去探究时间过期策略的执行：
+在前文中我们提到过，Caffeine 中 `maintenance` 方法负责缓存的维护，包括执行缓存的驱逐，所以我们便以这个方法作为起点去探究时间过期策略的执行：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
@@ -112,7 +110,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 }
 ```
 
-在自定义的过期策略中，我们便能够发现 `TimeWheel` 的身影：
+在自定义的过期策略中，我们便能够发现 `TimeWheel` 的身影，并调用了它的 `TimeWheel#advance` 方法：
 
 ```java
 abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
@@ -127,19 +125,23 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 }
 ```
 
-`TimeWheel` 是 Caffeine 缓存中定义的类，并在注释中如下写道：
+在深入 `TimeWheel` 的源码前，我们先通过源码注释了解下它的作用。`TimeWheel` 是 Caffeine 缓存中定义的类，它的类注释如下写道：
 
 一个 **分层的** 时间轮，能够以O（1）的时间复杂度添加、删除和触发过期事件。过期事件的执行被推迟到 `maintenance` 维护方法中的 `TimeWheel#advance` 逻辑中。
 
 > A hierarchical timer wheel to add, remove, and fire expiration events in amortized O(1) time. The expiration events are deferred until the timer is advanced, which is performed as part of the cache's maintenance cycle.
 
-其中 **分层（hierarchical）**，它这样解释：
+可见上文中我们看见的 `TimeWheel#advance` 方法是用来执行元素过期事件的。在这段注释中提到了 **分层（hierarchical）** 的概念，注释中还有一段内容对这个特性进行了描述：
 
 时间轮将计时器事件存储在循环缓冲区的桶中。**Bucket** 表示粗略的时间跨度，例如一分钟，并使用一个双向链表来记录事件。时间轮按层次结构（秒、分钟、小时、天）构建，这样当时间轮旋转时，在遥远的未来安排的事件会级联到较低的桶中。它允许在O（1）的时间复杂度下添加、删除和过期事件，在整个 **Bucket** 中的元素都会发生过期，同时有大部分元素过期的特殊情况由时间轮的轮换分摊。
 
 > A timer wheel stores timer events in buckets on a circular buffer. A bucket represents a coarse time span, e.g. one minute, and holds a doubly-linked list of events. The wheels are structured in a hierarchy (seconds, minutes, hours, days) so that events scheduled in the distant future are cascaded to lower buckets when the wheels rotate. This allows for events to be added, removed, and expired in O(1) time, where expiration occurs for the entire bucket, and the penalty of cascading is amortized by the rotations.
 
-接下来我们根据它的注释内容，详细探究一下 `TimeWheel` 是如何实现这种机制的。我们先来看它的构造方法：
+大概能够推测，它的“分层”概念指的是根据事件的过期时间将这些事件放在不同的“层”去管理，秒级别的在一层，分钟级别的在一层等等。那么接下来我们根据它的注释内容，详细探究一下 `TimeWheel` 是如何实现这种机制的。
+
+### constructor
+
+我们先来看它的构造方法：
 
 ```java
 final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
@@ -157,7 +159,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
         }
     }
 
-    // 双向链表头节点
+    // 定义 Sentinel 内部类，创建对象表示双向链表的哨兵节点
     static final class Sentinel<K, V> extends Node<K, V> {
         Node<K, V> prev;
         Node<K, V> next;
@@ -169,7 +171,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
 }
 ```
 
-它会创建如下所示的二维数组，每行都作为一个桶（Bucket），根据 `BUCKETS` 数组中定义的容量，每行桶的容量分别为 64、64、32、4、1，桶中元素为 `Sentinel` 为节点的双向链表，如下所示（其中...表示图中省略了31个桶）：
+它会创建如下所示的二维数组，每行都作为一个桶（Bucket），根据 `BUCKETS` 数组中定义的容量，每行桶的容量分别为 64、64、32、4、1，每个桶中的初始元素是创建 `Sentinel` 为节点的双向链表，如下所示（其中...表示图中省略了31个桶）：
 
 ![TimeWheel.drawio.png](TimeWheel.drawio.png)
 
@@ -177,7 +179,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
 
 ### schedule
 
-现在数据结构已经创建好了，那么究竟什么时候会向其中添加元素呢？在上文中我们提到过，向 Caffeine 缓存中 `put` 元素时会执行 `AddTask` 任务，其中有一段逻辑便会调用 `TimeWheel#schedule` 方法向其中添加元素：
+现在它的数据结构我们已经有了基本的了解，那么究竟什么时候会向其中添加元素呢？在前文中我们提到过，向 Caffeine 缓存中 `put` 元素时会注册 `AddTask` 任务，任务中有一段逻辑会调用 `TimeWheel#schedule` 方法向其中添加元素：
 
 ```java
 final class AddTask implements Runnable {
@@ -200,7 +202,7 @@ final class AddTask implements Runnable {
 }
 ```
 
-我们来看看 `schedule` 方法：
+我们来看看 `schedule` 方法，根据的它的入参可以发现上文注释中提到的“过期事件”便是 Node 节点本身：
 
 ```java
 final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
@@ -245,15 +247,15 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
 
     // 初次添加时，time 为元素的“过期时间”
     Node<K, V> findBucket(long time) {
-        // 计算 duration 持续时间
+        // 计算 duration 持续时间（有效期）
         long duration = time - nanos;
         // length 为 4
         int length = wheel.length - 1;
         for (int i = 0; i < length; i++) {
             // 注意这里它是将持续时间和 SPANS[i + 1] 作比较，如果小于则认为该节点在这个“层级”中
             if (duration < SPANS[i + 1]) {
-                // tick 指钟表的滴答声，用于表示它所在层级的偏移量
-                // 如果 duration < SPANS[1] 表示秒级别的时间跨度，则右移 SHIFT[0] 30 位，SPANS[0] 为 2^30 对应 1.07s，右移 30 位则将 time 表示为秒级别的时间跨度
+                // tick 指钟表的滴答声，用于表示它所在层级的偏移量，举个例子：
+                // 如果 duration < SPANS[1] 表示秒级别的时间跨度，则右移 SHIFT[0] 30 位，SPANS[0] 为 2^30 对应 1.07s，右移 30 位足以将 time 表示为秒级别的时间跨度
                 long ticks = (time >>> SHIFT[i]);
                 // 2进制数-1 的位与运算计算出节点在该层级的实际索引位置
                 int index = (int) (ticks & (wheel[i].length - 1));
@@ -264,7 +266,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
         return wheel[length][0];
     }
 
-    // 双向链表的尾插法添加元素
+    // 双向链表的尾插法添加元素，有了 Sentinel 哨兵节点避免了代码中的判空逻辑
     void link(Node<K, V> sentinel, Node<K, V> node) {
         node.setPreviousInVariableOrder(sentinel.getPreviousInVariableOrder());
         node.setNextInVariableOrder(sentinel);
@@ -317,13 +319,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef
 }
 ```
 
-接着回到 `findBucket` 方法，其中有逻辑 `duration < SPANS[i + 1]`，它是如何确定节点所在时间轮的层级的，为什么会有 `i + 1` 的操作呢？需要我们思考：`SPANS` 数组中存储的是层级的“时间跨度边界”，如注释中标记的，`SPANS[0]` 表示第一层级的时间为 1.07s，`SPANS[1]` 表示第二层级的时间为 1.14m，for 循环开始时便以 `SPANS[1]` 作为比较，如果 `duration` 小于 `SPANS[1]`，那么将该节点放在第一层级，这也就以为着第一层级的时间范围为 `t < 1.14 min`，认定它为秒级的时间跨度，第二层级的时间范围为 `1.14 min <= t < 1.22 h`，认定为分钟级的时间跨度，接下来的时间跨度以此类推。在这里明白了为什么 `final Node<K, V>[][] wheel` 为什么会将第一行第二行元素大小设定为 64，因为第一行为秒级别的时间跨度，60s 即为 1min，那么在这个秒级别的跨度下 64 的容量足以，同理，第二行为分钟级别的时间跨度，60min 即为 1h，那么在这个分钟级别的跨度下 64 的容量也足够了，以此类推。
+可以发现在元素被添加时它的过期时间已经被计算好了。接着回到 `findBucket` 方法，其中有逻辑 `duration < SPANS[i + 1]` 确定节点所在时间轮的层级。`SPANS` 数组中存储的是层级的“时间跨度边界”，如注释中标记的，`SPANS[0]` 表示第一层级的时间为 1.07s，`SPANS[1]` 表示第二层级的时间为 1.14m，for 循环开始时便以 `SPANS[1]` 作为比较，如果 `duration` 小于 `SPANS[1]`，那么将该节点放在第一层级，那么第一层级的时间范围为 `t < 1.14 min`，为秒级的时间跨度；第二层级的时间范围为 `1.14 min <= t < 1.22 h`，为分钟级的时间跨度，接下来的时间跨度以此类推。在这里也明白了为什么 `final Node<K, V>[][] wheel` 数据结构会将第一行、第二行元素大小设定为 64，因为第一行为秒级别的时间跨度，60s 即为 1min，那么在这个秒级别的跨度下 64 的容量足以，同理，第二行为分钟级别的时间跨度，60min 即为 1h，那么在这个分钟级别的跨度下 64 的容量也足够了。
 
-现在我们已经了解了向 `TimeWheel` 中添加元素的逻辑，那么现在我们可以回到文章开头提到的 `maintenance` 方法中调用的 `TimeWheel#advance` 方法中了。
+现在我们已经了解了向 `TimeWheel` 中添加元素的逻辑，那么现在我们可以回到文章开头提到的 `maintenance` 方法中调用的 `TimeWheel#advance` 方法了。
 
 ### advance
 
-`advance` 有推进、前进的意思，我认为在 `TimeWheel` 中表示“某个层级的时间有没有流动”更合适，以下是它的源码： 
+`advance` 有推进、前进的意思，我认为在 `TimeWheel` 中，`advance` 用来表示“某个层级的时间有没有流动”会更合适，以下是它的源码： 
 
 ```java
 final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
@@ -396,7 +398,7 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
             Node<K, V> sentinel = timerWheel[i & mask];
             Node<K, V> prev = sentinel.getPreviousInVariableOrder();
             Node<K, V> node = sentinel.getNextInVariableOrder();
-            // 重置哨兵节点，意味着这个桶中的元素都需要被处理
+            // 重置哨兵节点，意味着这个桶中的元素都需要被处理，该层级的时间有流逝，处理但不意味着有元素过期
             sentinel.setPreviousInVariableOrder(sentinel);
             sentinel.setNextInVariableOrder(sentinel);
 
@@ -432,6 +434,8 @@ final class TimerWheel<K, V> implements Iterable<Node<K, V>> {
 
 `expire` 方法并不复杂，本质上是将未过期的节点重新执行 `TimeWheel#schedule` 方法，将其划分到更精准的时间分层；将过期的节点驱逐，`evictEntry` 方法在 [缓存之美：万文详解 Caffeine 实现原理]() 中已经介绍过了，这里就不再赘述了。
 
-总结一下 `TimeWheel` 的流程：只有指定了 `expireAfter` 时间过期策略的缓存才会使用到时间轮。当元素被添加时，它的过期时间已经被计算好并赋值到 `variableTime` 字段中，根据当前元素的剩余有效期（`variableTime - nanos`）划分它在具体的时间轮层级（`wheel`），随着时间的流逝（`advance`），它所在的时间轮层级会不断变化，可能由小时级别被转移（`schedule`）到分钟级，当然它也可能过期被驱逐（`evictEntry`），这样将剩余有效期划分到更精准的时间层级中，可以更精准的控制元素的过期时间，比如秒级时间没有流逝的话，那么便无需检查分钟级或更高时间跨度级别的元素是否过期。完整的原理图如下：
+总结一下 `TimeWheel` 的流程：只有指定了 `expireAfter` 时间过期策略的缓存才会使用到时间轮。当元素被添加时，它的过期时间已经被计算好并赋值到 `variableTime` 字段中，根据当前元素的剩余有效期（`variableTime - nanos`）划分它在具体的时间轮层级（`wheel`），随着时间的流逝（`advance`），它所在的时间轮层级可能会不断变化，可能由小时级别被转移（`schedule`）到分钟级，当然它也可能过期直接被驱逐（`evictEntry`）。这样操作按照元素剩余有效期将其划分到更精准的时间层级中，可以更精准的控制元素的过期时间，比如秒级时间没有流逝的话，那么便无需检查分钟级或更高时间跨度级别的元素是否过期。Caffeine 缓存完整的原理图如下：
 
 ![caffeine-第 7 页.drawio.png](caffeine-%E7%AC%AC%207%20%E9%A1%B5.drawio.png)
+
+详细了解需要结合 [缓存之美：万文详解 Caffeine 实现原理]()。
