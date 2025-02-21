@@ -1,0 +1,79 @@
+<mxfile host="Electron" agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) draw.io/26.0.9 Chrome/128.0.6613.186 Electron/32.2.5 Safari/537.36" version="26.0.9">
+  <diagram name="第 1 页" id="WuVkcvpb8_6sUgGytqgu">
+    <mxGraphModel dx="821" dy="854" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-27" value="&lt;span&gt;&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 20px;&quot;&gt;核心2&lt;/font&gt;&lt;/span&gt;" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=11;fontColor=default;labelBackgroundColor=default;fillColor=none;strokeWidth=2;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="380" y="60" width="310" height="280" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-25" value="&lt;span&gt;&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 20px;&quot;&gt;&amp;nbsp;CPU&lt;/font&gt;&lt;/span&gt;" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=11;fontColor=default;labelBackgroundColor=default;fillColor=none;strokeWidth=2;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="10" y="20" width="700" height="500" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-17" value="&lt;font face=&quot;Comic Sans MS&quot;&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;&lt;b&gt;&amp;nbsp;内存&lt;/b&gt;&lt;/span&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="120" y="550" width="560" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-15" value="&lt;font face=&quot;Comic Sans MS&quot;&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;&lt;b&gt;&amp;nbsp; L3 Cache&lt;/b&gt;&lt;/span&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="120" y="370" width="560" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-4" value="&lt;font face=&quot;Comic Sans MS&quot;&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;&lt;b&gt;&amp;nbsp; L1 Cache&lt;/b&gt;&lt;/span&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="120" y="70" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-7" value="&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 16px;&quot;&gt;| &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;X&lt;/font&gt; | Y | ... |&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="230" y="110" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-8" value="&lt;font face=&quot;Comic Sans MS&quot;&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;&lt;b&gt;&amp;nbsp; L1 Cache&lt;/b&gt;&lt;/span&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="440" y="70" width="240" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-10" value="&lt;font face=&quot;Comic Sans MS&quot;&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;&lt;b&gt;&amp;nbsp; L2 Cache&lt;/b&gt;&lt;/span&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="120" y="190" width="240" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-23" style="edgeStyle=none;shape=connector;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;strokeColor=default;strokeWidth=2;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=default;labelBackgroundColor=default;endArrow=open;endFill=0;" edge="1" parent="1" source="cfhUZWdHRbf9VMeViwsV-11" target="cfhUZWdHRbf9VMeViwsV-18">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-24" style="edgeStyle=none;shape=connector;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=default;strokeWidth=2;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=default;labelBackgroundColor=default;endArrow=open;endFill=0;" edge="1" parent="1" source="cfhUZWdHRbf9VMeViwsV-11" target="cfhUZWdHRbf9VMeViwsV-18">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-11" value="&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 16px;&quot;&gt;| &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;X&lt;/font&gt; | &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;Y&lt;/font&gt; | ... |&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="340" y="440" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-12" value="&lt;font face=&quot;Comic Sans MS&quot;&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;&lt;b&gt;&amp;nbsp; L2 Cache&lt;/b&gt;&lt;/span&gt;&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="440" y="190" width="240" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-22" style="edgeStyle=none;shape=connector;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;strokeColor=default;strokeWidth=2;align=center;verticalAlign=middle;fontFamily=Helvetica;fontSize=11;fontColor=default;labelBackgroundColor=default;endArrow=open;endFill=0;" edge="1" parent="1" source="cfhUZWdHRbf9VMeViwsV-9" target="cfhUZWdHRbf9VMeViwsV-11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-9" value="&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 16px;&quot;&gt;| &lt;font style=&quot;color: rgb(0, 0, 0);&quot;&gt;X&lt;/font&gt; | &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;Y&lt;/font&gt; | ... |&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="550" y="260" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-14" value="&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 16px;&quot;&gt;| &lt;font style=&quot;color: rgb(0, 0, 0);&quot;&gt;X&lt;/font&gt; | &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;Y&lt;/font&gt; | ... |&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="550" y="110" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-21" style="rounded=0;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;endArrow=open;endFill=0;strokeWidth=2;" edge="1" parent="1" source="cfhUZWdHRbf9VMeViwsV-16" target="cfhUZWdHRbf9VMeViwsV-11">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-16" value="&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 16px;&quot;&gt;| &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;X&lt;/font&gt; | Y | ... |&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="230" y="260" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-18" value="&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 16px;&quot;&gt;| &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;X&lt;/font&gt; | &lt;font style=&quot;color: rgb(255, 0, 0);&quot;&gt;Y&lt;/font&gt; | ... |&lt;/font&gt;" style="rounded=0;whiteSpace=wrap;html=1;" vertex="1" parent="1">
+          <mxGeometry x="340" y="610" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-19" value="" style="endArrow=open;html=1;rounded=0;endFill=0;strokeWidth=2;entryX=0.25;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" target="cfhUZWdHRbf9VMeViwsV-16">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="260" y="140" as="sourcePoint" />
+            <mxPoint x="310" y="90" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-20" value="" style="endArrow=open;html=1;rounded=0;endFill=0;strokeWidth=2;entryX=0.25;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="609.5" y="140" as="sourcePoint" />
+            <mxPoint x="609.5" y="260" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="cfhUZWdHRbf9VMeViwsV-26" value="&lt;span&gt;&lt;font face=&quot;Comic Sans MS&quot; style=&quot;font-size: 20px;&quot;&gt;核心1&lt;/font&gt;&lt;/span&gt;" style="rounded=0;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=11;fontColor=default;labelBackgroundColor=default;fillColor=none;strokeWidth=2;align=left;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="60" y="60" width="310" height="280" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
