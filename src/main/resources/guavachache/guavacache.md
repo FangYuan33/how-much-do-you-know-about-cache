@@ -146,7 +146,7 @@ static class Segment<K, V> extends ReentrantLock {
 
 在其中一段 JavaDoc 值得读一下：
 
-Segments 维护键值对列表并且一直保持数据一致性。因此可以在不加锁的情况下进行读操作。键值对对象中的 `next` 字段被 `final` 修饰，所有的列表添加操作都只能在每个桶的前面进行，这也就使得检查变更比较容易，并且遍历速度也比较快。当节点需要更改时，会创建新节点来替换它们。这对于哈希表来说效果很好，因为桶列表往往很短（平均长度小于二）。
+**Segments** 内部维护了缓存本身（`final LocalCache<K, V> map`），所以它能一直保持数据一致性，因此可以在不加锁的情况下进行读操作。键值对对象中的 `next` 字段被 `final` 修饰，所有的列表添加操作都只能在每个桶的前面进行，这也就使得检查变更比较容易，并且遍历速度也比较快。当节点需要更改时，会创建新节点来替换它们。这对于哈希表来说效果很好，因为桶列表往往很短（平均长度小于二）。
 
 因此，读操作可以在不加锁的情况下进行，但依赖于被 `volatile` 关键字修饰的变量，因为这个关键字能确保“可见性”。对大多数操作来说，可以将记录元素数量的字段 `count` 来作为确保可见性的变量。它带来了很多便利，在很多读操作中都需要参考这个字段：
 
@@ -232,7 +232,7 @@ static class Segment<K, V> extends ReentrantLock {
         keyReferenceQueue = map.usesKeyReferences() ? new ReferenceQueue<>() : null;
         valueReferenceQueue = map.usesValueReferences() ? new ReferenceQueue<>() : null;
 
-        // 用于记录最近元素被访问的顺序
+        // 用于记录“最近”元素被访问的顺序
         recencyQueue = map.usesAccessQueue() ? new ConcurrentLinkedQueue<>() : LocalCache.discardingQueue();
 
         // 用于记录元素的写入顺序，元素被写入时会被添加到尾部
@@ -264,3 +264,442 @@ static class Segment<K, V> extends ReentrantLock {
 
 
 
+### put
+
+在深入 `put` 方法前，我们需要先了解下创建键值对元素的逻辑。在调用构造方法的逻辑时，其中 `entryFactory` 字段我们没具体讲解，在这里详细描述下，因为它与键值对的创建有关。`EntryFactory` 是一个枚举类，它其中定义了如 `STRONG_ACCESS_WRITE` 和 `WEAK_ACCESS_WRITE` 等一系列枚举，并根据创建缓存时指定的 `Key` 和 `Value` 引用类型来决定具体是哪个枚举，如其中的 `EntryFactory#getFactory` 方法所示：
+
+```java
+enum EntryFactory {
+    STRONG {
+        // ...
+    },
+    STRONG_ACCESS {
+        // ...
+    },
+    STRONG_WRITE {
+        // ...  
+    },
+    STRONG_ACCESS_WRITE {
+        // ...
+    },
+    // ...
+    WEAK_ACCESS_WRITE {
+        // ...
+    };
+
+    static final int ACCESS_MASK = 1;
+    static final int WRITE_MASK = 2;
+    static final int WEAK_MASK = 4;
+    
+    static final EntryFactory[] factories = {
+            STRONG,
+            STRONG_ACCESS,
+            STRONG_WRITE,
+            STRONG_ACCESS_WRITE,
+            WEAK,
+            WEAK_ACCESS,
+            WEAK_WRITE,
+            WEAK_ACCESS_WRITE,
+    };
+
+    static EntryFactory getFactory(Strength keyStrength, boolean usesAccessQueue, boolean usesWriteQueue) {
+        int flags = ((keyStrength == Strength.WEAK) ? WEAK_MASK : 0)
+                        | (usesAccessQueue ? ACCESS_MASK : 0)
+                        | (usesWriteQueue ? WRITE_MASK : 0);
+        return factories[flags];
+    }
+}
+```
+
+当不指定 `Key` 和 `Value` 的引用类型时（`Key` 和 `Value` 均为强引用），**默认为 `STRONG_ACCESS_WRITE` 枚举**，我们主要关注下它的逻辑：
+
+```java
+enum EntryFactory {
+    STRONG_ACCESS_WRITE {
+        @Override
+        <K, V> ReferenceEntry<K, V> newEntry(
+                Segment<K, V> segment, K key, int hash, @CheckForNull ReferenceEntry<K, V> next) {
+            return new StrongAccessWriteEntry<>(key, hash, next);
+        }
+
+        // ...
+    }
+}
+```
+
+其中 `newEntry` 为创建键值对元素的方法，创建的键值对类型为 `StrongAccessWriteEntry`，我们看下它的具体实现：
+
+```java
+class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
+    
+    static class StrongEntry<K, V> extends AbstractReferenceEntry<K, V> {
+        
+        final K key;
+        final int hash;
+        @CheckForNull final ReferenceEntry<K, V> next;
+        volatile ValueReference<K, V> valueReference = unset();
+        
+        StrongEntry(K key, int hash, @CheckForNull ReferenceEntry<K, V> next) {
+            this.key = key;
+            this.hash = hash;
+            this.next = next;
+        }
+        
+        // ...
+    }
+
+    static final class StrongAccessWriteEntry<K, V> extends StrongEntry<K, V> {
+
+        volatile long accessTime = Long.MAX_VALUE;
+        volatile long writeTime = Long.MAX_VALUE;
+
+        @Weak ReferenceEntry<K, V> nextAccess = nullEntry();
+        @Weak ReferenceEntry<K, V> previousAccess = nullEntry();
+
+        @Weak ReferenceEntry<K, V> nextWrite = nullEntry();
+        @Weak ReferenceEntry<K, V> previousWrite = nullEntry();
+
+        StrongAccessWriteEntry(K key, int hash, @CheckForNull ReferenceEntry<K, V> next) {
+            super(key, hash, next);
+        }
+    }
+}
+```
+
+`StrongAccessWriteEntry` 与它的父类 `StrongEntry` 均为定义在 `LocalCache` 内的静态内部类，构造方法需要指定 `Key, hash, next` 三个变量，这三个变量均定义在 `StrongEntry` 中，注意第三个变量 `ReferenceEntry<K, V> next`，它被父类中 `StrongEntry#next` 字段引用，并且该字段被 `final` 修饰，这与前文 JavaDoc 中所描述的内容相对应：
+
+> 键值对对象中的 `next` 字段被 `final` 修饰，所有的列表添加操作都只能在每个桶的前面进行，这也就使得检查变更比较容易，并且遍历速度也比较快。
+
+所以实际上在添加新的键值对元素时，针对每个桶中元素操作采用的是“头插法”，这些元素是通过 `next` 指针引用的 **单向链表**。现在了解了元素的类型和创建逻辑，我们再来看下 `put` 方法的实现。
+
+Guava Cache 中是不允许添加 null 键和 null 值的，如果添加了 null 键或 null 值，会抛出 `NullPointerException` 异常：
+
+```java
+class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
+    
+    // ...
+
+    final Segment<K, V>[] segments;
+
+    final int segmentShift;
+
+    final int segmentMask;
+
+    @GuardedBy("this")
+    long totalWeight;
+    
+    @CheckForNull
+    @CanIgnoreReturnValue
+    @Override
+    public V put(K key, V value) {
+        checkNotNull(key);
+        checkNotNull(value);
+        // 计算 hash 值，过程中调用了 rehash 扰动函数使 hash 更均匀
+        int hash = hash(key);
+        // 根据 hash 值路由到具体的 Segment 段，再调用 Segment 的 put 方法
+        return segmentFor(hash).put(key, hash, value, false);
+    }
+
+    Segment<K, V> segmentFor(int hash) {
+        // 位移并位与运算，segmentMask 为段数组长度减一，保证计算结果在有效范围内
+        return segments[(hash >>> segmentShift) & segmentMask];
+    }
+}
+```
+
+注意其中的注解 `@GuardedBy` 表示某方法或字段被调用或访问时需要持有哪个同步锁，在 Caffeine 中也有类似的应用。
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    final AtomicInteger readCount = new AtomicInteger();
+
+    @GuardedBy("this")
+    final Queue<ReferenceEntry<K, V>> accessQueue;
+    final Queue<ReferenceEntry<K, V>> recencyQueue;
+    @GuardedBy("this")
+    final Queue<ReferenceEntry<K, V>> writeQueue;
+
+    // guava cache 本身
+    @Weak final LocalCache<K, V> map;
+
+    // Segment 中保存元素的数组
+    @CheckForNull volatile AtomicReferenceArray<ReferenceEntry<K, V>> table;
+
+    // 计数器
+    final StatsCounter statsCounter;
+
+    // 该段中的元素数量
+    volatile int count;
+
+    // 总的权重，不配置也表示元素数量，每个元素的权重为 1
+    @GuardedBy("this")
+    long totalWeight;
+    
+    @CanIgnoreReturnValue
+    @CheckForNull
+    V put(K key, int hash, V value, boolean onlyIfAbsent) {
+        // 先加锁 ReentrantLock#lock 实现
+        lock();
+        try {
+            long now = map.ticker.read();
+            preWriteCleanup(now);
+
+            int newCount = this.count + 1;
+            if (newCount > this.threshold) { // ensure capacity
+                expand();
+                newCount = this.count + 1;
+            }
+
+            AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
+            int index = hash & (table.length() - 1);
+            ReferenceEntry<K, V> first = table.get(index);
+
+            // Look for an existing entry.
+            for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
+                K entryKey = e.getKey();
+                if (e.getHash() == hash
+                        && entryKey != null
+                        && map.keyEquivalence.equivalent(key, entryKey)) {
+                    // We found an existing entry.
+
+                    ValueReference<K, V> valueReference = e.getValueReference();
+                    V entryValue = valueReference.get();
+
+                    if (entryValue == null) {
+                        ++modCount;
+                        if (valueReference.isActive()) {
+                            enqueueNotification(
+                                    key, hash, entryValue, valueReference.getWeight(), RemovalCause.COLLECTED);
+                            setValue(e, key, value, now);
+                            newCount = this.count; // count remains unchanged
+                        } else {
+                            setValue(e, key, value, now);
+                            newCount = this.count + 1;
+                        }
+                        this.count = newCount; // write-volatile
+                        evictEntries(e);
+                        return null;
+                    } else if (onlyIfAbsent) {
+                        // Mimic
+                        // "if (!map.containsKey(key)) ...
+                        // else return map.get(key);
+                        recordLockedRead(e, now);
+                        return entryValue;
+                    } else {
+                        // clobber existing entry, count remains unchanged
+                        ++modCount;
+                        enqueueNotification(
+                                key, hash, entryValue, valueReference.getWeight(), RemovalCause.REPLACED);
+                        setValue(e, key, value, now);
+                        evictEntries(e);
+                        return entryValue;
+                    }
+                }
+            }
+
+            // Create a new entry.
+            ++modCount;
+            ReferenceEntry<K, V> newEntry = newEntry(key, hash, first);
+            setValue(newEntry, key, value, now);
+            table.set(index, newEntry);
+            newCount = this.count + 1;
+            this.count = newCount; // write-volatile
+            evictEntries(newEntry);
+            return null;
+        } finally {
+            unlock();
+            postWriteCleanup();
+        }
+    }
+
+    @GuardedBy("this")
+    void preWriteCleanup(long now) {
+        // 执行加锁的清理操作，包括处理引用队列和过期元素
+        runLockedCleanup(now);
+    }
+
+    void runLockedCleanup(long now) {
+        // 仍然是 ReentrantLock#tryLock 实现
+        if (tryLock()) {
+            try {
+                // 处理引用队列（本文不对指定 Key 或 Value 为 weekReference 的情况进行分析）
+                drainReferenceQueues();
+                // 处理元素过期
+                expireEntries(now);
+                // 写后读次数清零
+                readCount.set(0);
+            } finally {
+                unlock();
+            }
+        }
+    }
+
+    @GuardedBy("this")
+    void expireEntries(long now) {
+        // 处理最近访问队列 recencyQueue 和访问队列 accessQueue
+        drainRecencyQueue();
+
+        ReferenceEntry<K, V> e;
+        // 从头节点开始遍历写队列 writeQueue，将过期的元素移除
+        while ((e = writeQueue.peek()) != null && map.isExpired(e, now)) {
+            if (!removeEntry(e, e.getHash(), RemovalCause.EXPIRED)) {
+                throw new AssertionError();
+            }
+        }
+        while ((e = accessQueue.peek()) != null && map.isExpired(e, now)) {
+            if (!removeEntry(e, e.getHash(), RemovalCause.EXPIRED)) {
+                throw new AssertionError();
+            }
+        }
+    }
+
+    // 将元素的最近被访问队列 recencyQueue 清空，并使用尾插法将它们都放到访问队列 accessQueue 的尾节点
+    @GuardedBy("this")
+    void drainRecencyQueue() {
+        ReferenceEntry<K, V> e;
+        // 遍历元素最近被访问队列 recencyQueue
+        while ((e = recencyQueue.poll()) != null) {
+            // 如果该元素在访问队列 accessQueue 中
+            if (accessQueue.contains(e)) {
+                // 则将其放到尾节点
+                accessQueue.add(e);
+            }
+            // 源码中对这里的 IF 判断，标注了如下内容来解释如此判断的原因：
+            // 尽管元素已经在缓存中删除，但它仍可能在 recencyQueue 队列中。
+            // 这种情况可能出现在开发者操作元素删除或清空段中所有元素的同时执行读操作
+        }
+    }
+
+    @VisibleForTesting
+    @GuardedBy("this")
+    @CanIgnoreReturnValue
+    boolean removeEntry(ReferenceEntry<K, V> entry, int hash, RemovalCause cause) {
+        int newCount = this.count - 1;
+        AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
+        // 位与运算找到对应的桶，获取头节点
+        int index = hash & (table.length() - 1);
+        ReferenceEntry<K, V> first = table.get(index);
+
+        for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
+            // 找到了对应的元素则操作移除
+            if (e == entry) {
+                ++modCount;
+                // 在链表chain中移除元素，注意 e 表示待移除的元素
+                ReferenceEntry<K, V> newFirst = removeValueFromChain(first, e, e.getKey(), hash, 
+                        e.getValueReference().get(), e.getValueReference(), cause);
+                // 注意这里又重新计算了 newCount，防止在方法执行前的 newCount 快照值发生变更
+                newCount = this.count - 1;
+                // 桶的位置更新为新的链表头节点
+                table.set(index, newFirst);
+                // count 被 volatile 修饰，可见性写操作
+                this.count = newCount;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    /**
+     * 将元素从队列中移除
+     * 
+     * @param first 队列的头节点
+     * @param entry 待移除元素
+     * @param key   待移除元素的 key
+     * @param hash  待移除元素的 hash 值
+     * @param value 待移除元素的 value 值
+     * @param valueReference 带移除元素的 value 引用对象
+     * @param cause 被移除的原因
+     * @return 返回链表头节点
+     */
+    @GuardedBy("this")
+    @CheckForNull
+    ReferenceEntry<K, V> removeValueFromChain(ReferenceEntry<K, V> first, ReferenceEntry<K, V> entry, 
+                                              @CheckForNull K key, int hash, V value, ValueReference<K, V> valueReference, 
+                                              RemovalCause cause) {
+        // 入队元素被移除的通知等操作
+        enqueueNotification(key, hash, value, valueReference.getWeight(), cause);
+        // 在写队列和访问队列中移除元素
+        writeQueue.remove(entry);
+        accessQueue.remove(entry);
+
+        if (valueReference.isLoading()) {
+            valueReference.notifyNewValue(null);
+            return first;
+        } else {
+            // 将元素在链表中移除
+            return removeEntryFromChain(first, entry);
+        }
+    }
+    
+    @GuardedBy("this")
+    @CheckForNull
+    ReferenceEntry<K, V> removeEntryFromChain(ReferenceEntry<K, V> first, ReferenceEntry<K, V> entry) {
+        // 初始化计数跟踪数量变化
+        int newCount = count;
+        // 被移除元素的 next 元素，作为新的头节点
+        ReferenceEntry<K, V> newFirst = entry.getNext();
+        // 遍历从 原头节点 first 到 被移除元素 entry 之间的所有元素
+        for (ReferenceEntry<K, V> e = first; e != entry; e = e.getNext()) {
+            // 创建一个新的节点，该节点是节点 e 的副本，并把新节点的 next 指针指向 newFirst 节点
+            ReferenceEntry<K, V> next = copyEntry(e, newFirst);
+            // 如果 next 不为空，变更 newFirst 的引用，指向刚刚创建的节点
+            // 如果原链表为 a -> b -> c -> d 移除 c 后链表为 b -> a -> d
+            if (next != null) {
+                newFirst = next;
+            } else {
+                // 如果 next 为空，表示发生了垃圾回收，将该被回收的元素的移除
+                removeCollectedEntry(e);
+                // 计数减一
+                newCount--;
+            }
+        }
+        // 更新计数
+        this.count = newCount;
+        // 返回新的头节点
+        return newFirst;
+    }
+
+    @GuardedBy("this")
+    void removeCollectedEntry(ReferenceEntry<K, V> entry) {
+        // 入队元素被移除的通知等操作
+        enqueueNotification(entry.getKey(), entry.getHash(), entry.getValueReference().get(),
+                entry.getValueReference().getWeight(), RemovalCause.COLLECTED);
+        writeQueue.remove(entry);
+        accessQueue.remove(entry);
+    }
+
+    @GuardedBy("this")
+    void enqueueNotification(@CheckForNull K key, int hash, @CheckForNull V value, int weight, RemovalCause cause) {
+        // 将当前元素的权重在总权重中减去
+        totalWeight -= weight;
+        // 如果元素被驱逐，则在计数器中记录
+        if (cause.wasEvicted()) {
+            statsCounter.recordEviction();
+        }
+        // 如果配置了驱逐通知，则将该元素被驱逐的原因等信息放入队列
+        if (map.removalNotificationQueue != DISCARDING_QUEUE) {
+            RemovalNotification<K, V> notification = RemovalNotification.create(key, value, cause);
+            map.removalNotificationQueue.offer(notification);
+        }
+    }
+}
+
+class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
+    // 判断元素是否过期，它的逻辑非常简单，如果配置了对应的过期模式，如访问后过期或写后过期
+    // 会根据当前时间与元素的访问时间或写入时间进行比较，如果超过配置的过期时间，则返回 true，否则返回 false
+    boolean isExpired(ReferenceEntry<K, V> entry, long now) {
+        checkNotNull(entry);
+        if (expiresAfterAccess() && (now - entry.getAccessTime() >= expireAfterAccessNanos)) {
+            return true;
+        }
+        if (expiresAfterWrite() && (now - entry.getWriteTime() >= expireAfterWriteNanos)) {
+            return true;
+        }
+        return false;
+    }
+    
+}
+```
