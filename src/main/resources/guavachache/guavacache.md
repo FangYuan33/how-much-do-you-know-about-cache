@@ -441,6 +441,7 @@ static class Segment<K, V> extends ReentrantLock {
     // capacity * 0.75
     int threshold;
 
+    // 更新次数，用于确保在批量读取的情况下，保证数据一致性，如果多次读取时 modCount 不一致则需要重试
     int modCount;
     
     @CanIgnoreReturnValue
@@ -474,31 +475,38 @@ static class Segment<K, V> extends ReentrantLock {
                     ValueReference<K, V> valueReference = e.getValueReference();
                     V entryValue = valueReference.get();
 
+                    // 通过元素的 value 是否为 null 的情况来判断
                     if (entryValue == null) {
                         ++modCount;
+                        // StrongValueReference 类型默认 active 为 true 表示 value 值是有效的
                         if (valueReference.isActive()) {
+                            // 但是此时元素的 value 值为空，说明该 value 值已经被垃圾回收了，所以需要将该元素 value 被垃圾回收的通知加入到通知队列中
+                            // 并在总权重中将该元素的权重减去
                             enqueueNotification(key, hash, entryValue, valueReference.getWeight(), RemovalCause.COLLECTED);
+                            // 更新为新的 value
                             setValue(e, key, value, now);
-                            newCount = this.count; // count remains unchanged
+                            // 元素总数不变更
+                            newCount = this.count;
                         } else {
+                            // 赋值新的 Value 并需要将元素数 +1
                             setValue(e, key, value, now);
                             newCount = this.count + 1;
                         }
-                        this.count = newCount; // write-volatile
+                        // 变更 count 值（可见性）
+                        this.count = newCount;
                         // 3. 驱逐元素
                         evictEntries(e);
                         return null;
                     } else if (onlyIfAbsent) {
-                        // Mimic
-                        // "if (!map.containsKey(key)) ...
-                        // else return map.get(key);
+                        // 如果 onlyIfAbsent 为 true，那么已存在元素的 value 是不会被覆盖的，只需要记录读操作即可
                         recordLockedRead(e, now);
                         return entryValue;
                     } else {
-                        // clobber existing entry, count remains unchanged
+                        // 这种情况是 value 不为空，需要将旧值替换成新值
+                        // 变更修改次数
                         ++modCount;
-                        enqueueNotification(
-                                key, hash, entryValue, valueReference.getWeight(), RemovalCause.REPLACED);
+                        // 同样是先将该元素的权重减去，并将元素 value 被替换的通知加入到通知队列中
+                        enqueueNotification(key, hash, entryValue, valueReference.getWeight(), RemovalCause.REPLACED);
                         setValue(e, key, value, now);
                         // 3. 驱逐元素
                         evictEntries(e);
@@ -521,9 +529,56 @@ static class Segment<K, V> extends ReentrantLock {
             evictEntries(newEntry);
             return null;
         } finally {
+            // 执行完操作，解锁
             unlock();
+            // 4. 写后操作，主要是处理通知，在后文中介绍
             postWriteCleanup();
         }
+    }
+
+    @GuardedBy("this")
+    void setValue(ReferenceEntry<K, V> entry, K key, V value, long now) {
+        ValueReference<K, V> previous = entry.getValueReference();
+        // 计算元素权重，如果没有执行权重计算函数默认为 1
+        int weight = map.weigher.weigh(key, value);
+        checkState(weight >= 0, "Weights must be non-negative");
+
+        // 更新元素的 value 值
+        ValueReference<K, V> valueReference = map.valueStrength.referenceValue(this, entry, value, weight);
+        entry.setValueReference(valueReference);
+        // 处理写操作
+        recordWrite(entry, weight, now);
+        // StrongValueReference 该方法为空实现
+        previous.notifyNewValue(value);
+    }
+
+    @GuardedBy("this")
+    void recordWrite(ReferenceEntry<K, V> entry, int weight, long now) {
+        // 将元素的最近被访问队列 recencyQueue 清空，并使用尾插法将它们都放到访问队列 accessQueue 的尾节点
+        drainRecencyQueue();
+        // 变更总权重
+        totalWeight += weight;
+
+        // 如果配置了访问后或写后过期则更新元素的访问后或写后时间
+        if (map.recordsAccess()) {
+            entry.setAccessTime(now);
+        }
+        if (map.recordsWrite()) {
+            entry.setWriteTime(now);
+        }
+        // 添加到访问队列和写队列中
+        accessQueue.add(entry);
+        writeQueue.add(entry);
+    }
+
+    @GuardedBy("this")
+    void recordLockedRead(ReferenceEntry<K, V> entry, long now) {
+        // 配置了访问后过期时间则更新该元素的访问时间
+        if (map.recordsAccess()) {
+            entry.setAccessTime(now);
+        }
+        // 将该元素添加到访问队列中
+        accessQueue.add(entry);
     }
 }
 
@@ -891,6 +946,46 @@ static class Segment<K, V> extends ReentrantLock {
             }
         }
         throw new AssertionError();
+    }
+}
+```
+
+#### postWriteCleanup
+
+
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    @Weak final LocalCache<K, V> map;
+    
+    void postWriteCleanup() {
+        runUnlockedCleanup();
+    }
+
+    void runUnlockedCleanup() {
+        // locked cleanup may generate notifications we can send unlocked
+        if (!isHeldByCurrentThread()) {
+            map.processPendingNotifications();
+        }
+    }
+}
+
+class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
+
+    final Queue<RemovalNotification<K, V>> removalNotificationQueue;
+
+    final RemovalListener<K, V> removalListener;
+    
+    void processPendingNotifications() {
+        RemovalNotification<K, V> notification;
+        while ((notification = removalNotificationQueue.poll()) != null) {
+            try {
+                removalListener.onRemoval(notification);
+            } catch (Throwable e) {
+                logger.log(Level.WARNING, "Exception thrown by removal listener", e);
+            }
+        }
     }
 }
 ```
