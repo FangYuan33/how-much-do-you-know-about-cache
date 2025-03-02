@@ -1,8 +1,52 @@
+本文将结合 **Guava Cache** 的源码来分析它的实现原理，并阐述它相比与 Caffeine Cache 在性能上的劣势。为了让大家对 Guava Cache 理解起来更容易，我们还是在开篇介绍它的原理：
 
+![]()
+
+Guava Cache 通过分段（`Segment`）锁（`ReentrantLock`）机制、`volatile` 变量和多种缓存策略，实现了性能相对 Caffeine 性能较差的缓存，它的数据结构如上图所示。它会将缓存分成多个段（`Segment`）去管理，如果要创建大小为 1000 的缓存，那么实际上会分配 4 个段，每个段的最大容量为 250，读写操作在执行时都会经 `segmentFor` 方法路由到某一个段。具体的数据结构实现都在 `Segment` 中，它对元素的管理采用的是 `AtomicReferenceArray` 数组，在初始化时是较小的容量，并随着元素的增多触发扩容机制。我们称数组中每个索引的位置为“桶”，每个桶中保存了元素的引用，这些元素是通过单向链表维护的，每当有新元素添加时，采用的是“头插法”。此外，在 `Segment` 中还维护了三个基于 **LRU 算法** 的队列，处于尾部的元素最“新”，分别是 `accessQueue`、`writeQueue` 和 `recencyQueue`，它们分别用于记录被访问的元素、被写入的元素和“最近”被访问的元素。`accessQueue` 的主要作用是在对超过最大容量（超过访问后过期时间）的元素进行驱逐时，优先将最近被访问的越少的元素驱逐（头节点开始遍历）；`writeQueue` 的主要作用是对写后过期的元素进行驱逐时，优先将最近最少被访问的元素驱逐，因为越早被添加的元素越早过期，当发现某元素未过期时，后续队列中的元素是不需要判断的；`recencyQueue` 的作用是记录被访问过的元素，它们最终都会被移动到 `accessQueue` 中，并根据访问顺序添加到其尾节点中。
+
+对元素生命周期的管理主要是在 `put` 方法中完成的，`put` 相关的操作都需要加锁，如图中左上方所示，均为缓存元素的 `CleanUp` 相关的方法。Guava Cache 为了在不触发写操作而有大量读操作时也能正常触发对缓存元素的管理，添加了一个 `readCount` 变量，每次读请求都会使其累加，直到该变量超过规定阈值，也会触发缓存元素的驱逐（`postReadCleanUp`），保证数据的一致性，如图中右上方所示。
+
+以上便是对其实现原来的概括，接下来我们通过创建最大大小为 1000，并配置有访问后和写后过期时间的 `LoadingCache` 来分析 Guava Cache 的实现原理，主要关注它的构造方法，`put` 方法和 `get` 方法：
+
+```java
+public class TestGuavaCache {
+
+    @Test
+    public void test() {
+        LoadingCache<String, String> cache = CacheBuilder.newBuilder()
+                .maximumSize(1000)
+                .expireAfterWrite(10, TimeUnit.SECONDS)
+                .expireAfterAccess(10, TimeUnit.SECONDS)
+                .build(
+                        new CacheLoader<>() {
+                            @Override
+                            public String load(String key) {
+                                return String.valueOf(key.hashCode());
+                            }
+                        }
+                );
+
+        cache.put("key1", "value1");
+
+        try {
+            System.out.println(cache.get("key"));
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
+```
+
+### constructor
+
+首先我们来看一下它的构造方法，它会将创建缓存时指定的参数记录下来，比如访问后过期时间（`expireAfterAccessNanos`），写后过期时间（`expireAfterWriteNanos`）等等，除此之外还包括 `Segment` 分段对象的创建，定义分段的数量和每个分段的大小，并将这些 `Segment` 对象保存在一个数组中，以创建最大元素数量为 1000 的缓存为例，它会创建 4 个分段，每个分段分配 250 个元素。源码如下所示，均为赋值操作，可关注 `Segment` 相关逻辑：
 
 ```java
 class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
 
+    static final int MAX_SEGMENTS = 1 << 16;
+    static final int MAXIMUM_CAPACITY = 1 << 30;
+    
     final int concurrencyLevel;
 
     final Strength keyStrength;
@@ -29,9 +73,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
     final int segmentShift;
     final Segment<K, V>[] segments;
     
-    LocalCache(
-            CacheBuilder<? super K, ? super V> builder, @CheckForNull CacheLoader<? super K, V> loader) {
-        
+    LocalCache(CacheBuilder<? super K, ? super V> builder, @CheckForNull CacheLoader<? super K, V> loader) {
         // 并发级别，不指定默认为 4
         concurrencyLevel = min(builder.getConcurrencyLevel(), MAX_SEGMENTS);
 
@@ -55,10 +97,8 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 
         // 元素驱逐监听器
         removalListener = builder.getRemovalListener();
-        removalNotificationQueue =
-                (removalListener == NullListener.INSTANCE)
-                        ? LocalCache.discardingQueue()
-                        : new ConcurrentLinkedQueue<>();
+        removalNotificationQueue = 
+                (removalListener == NullListener.INSTANCE) ? LocalCache.discardingQueue() : new ConcurrentLinkedQueue<>();
 
         // 定义 Ticker 可以模拟时间流动来验证逻辑
         ticker = builder.getTicker(recordsTime());
@@ -77,8 +117,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
         int segmentShift = 0;
         int segmentCount = 1;
         // 保证分段数量不低于并发级别 且 段数*20不超过最大权重，保证每个段的元素数量至少为 10
-        while (segmentCount < concurrencyLevel
-                && (!evictsBySize() || segmentCount * 20L <= maxWeight)) {
+        while (segmentCount < concurrencyLevel && (!evictsBySize() || segmentCount * 20L <= maxWeight)) {
             // 分段位移+1
             ++segmentShift;
             // 分段数量为 2的n次幂
@@ -109,22 +148,24 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
                     maxSegmentWeight--;
                 }
                 // 创建 Segment 对象，segmentSize为4，maxSegmentWeight为250
-                this.segments[i] =
-                        createSegment(segmentSize, maxSegmentWeight, builder.getStatsCounterSupplier().get());
+                this.segments[i] = createSegment(segmentSize, maxSegmentWeight, builder.getStatsCounterSupplier().get());
             }
         }
         // 如果未指定基于大小的驱逐策略，创建的 Segment 对象的 maxSegmentWeight 为 UNSET_INT
         else {
             for (int i = 0; i < this.segments.length; ++i) {
-                this.segments[i] =
-                        createSegment(segmentSize, UNSET_INT, builder.getStatsCounterSupplier().get());
+                this.segments[i] = createSegment(segmentSize, UNSET_INT, builder.getStatsCounterSupplier().get());
             }
         }
+    }
+
+    final Segment<K, V>[] newSegmentArray(int ssize) {
+        return (Segment<K, V>[]) new Segment<?, ?>[ssize];
     }
 }
 ```
 
-我们接着看下创建 Segment 的方法 `LocalCache#createSegment`，它直接调用了 `Segment` 的构造方法：
+我们接着看下创建 `Segment` 的方法 `LocalCache#createSegment`，它直接调用了 `Segment` 的构造方法：
 
 ```java
 class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
@@ -136,7 +177,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 }
 ```
 
-`Segment` 是 `LocalCache` 内的静态内部类，根据它的中文释义，它可能在缓存中起到了将数据分段管理的作用。它继承了 `ReentrantLock` 主要为了简化锁定的操作：
+`Segment` 是 `LocalCache` 内的静态内部类，它在缓存中起到了将数据分段管理的作用。它继承了 `ReentrantLock`，主要为了简化锁定的操作：
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -144,16 +185,16 @@ static class Segment<K, V> extends ReentrantLock {
 }
 ```
 
-在其中一段 JavaDoc 值得读一下：
+在该类中有一段 JavaDoc 值得读一下：
 
-**Segments** 内部维护了缓存本身（`final LocalCache<K, V> map`），所以它能一直保持数据一致性，因此可以在不加锁的情况下进行读操作。键值对对象中的 `next` 字段被 `final` 修饰，所有的列表添加操作都只能在每个桶的前面进行，这也就使得检查变更比较容易，并且遍历速度也比较快。当节点需要更改时，会创建新节点来替换它们。这对于哈希表来说效果很好，因为桶列表往往很短（平均长度小于二）。
+**Segments** 内部维护了缓存本身（`final LocalCache<K, V> map`），所以它能一直保持数据一致性，也因此可以在不加锁的情况下进行读操作。键值对对象中的 `next` 字段被 `final` 修饰，所有的添加操作都只能在每个桶的前面进行（头插法），这也就使得检查变更比较容易，并且遍历速度也比较快。当节点需要更改时，会创建新节点来替换它们（深拷贝）。这对于哈希表来说效果很好，因为桶列表往往很短（平均长度小于二）。
 
-因此，读操作可以在不加锁的情况下进行，但依赖于被 `volatile` 关键字修饰的变量，因为这个关键字能确保“可见性”。对大多数操作来说，可以将记录元素数量的字段 `count` 来作为确保可见性的变量。它带来了很多便利，在很多读操作中都需要参考这个字段：
+读操作可以在不加锁的情况下进行，但依赖于被 `volatile` 关键字修饰的变量，因为这个关键字能确保“可见性”。对大多数操作来说，可以将记录元素数量的字段 `count` 来作为确保可见性的变量。它带来了很多便利，在很多读操作中都需要参考这个字段：
 
 - 未加锁的读操作必须首先读取 `count` 字段，如果它是 0，则不应读任何元素
 - 加锁的写操作在任何桶发生结构性更改后都需要修改 `count` 字段值，这些写操作不能再任何情况下导致并发读操作发生读取数据不一致的情况，这样的保证使得 Map 中的读操作更容易。比如，没有操作可以揭示 Map 中添加了新的元素但是 `count` 字段没有被更新的情况，因此相对于读取没有原子性要求。
 
-作为指南，所有关键的被 `volatile` 修饰的字段的读取和写入都会用注释标记。
+作为提示，所有被 `volatile` 修饰的字段都很关键，它们的读取和写入都会用注释标记。
 
 >     /*
      * Segments maintain a table of entry lists that are ALWAYS kept in a consistent state, so can
@@ -260,13 +301,15 @@ static class Segment<K, V> extends ReentrantLock {
 }
 ```
 
-根据上述代码和注释信息，以我们创建的最大容量为 1000，过期时间为 10s 的 `LoadingCache` 为例，实际上它会将 1000 的最大容量分为 4 个段，创建 4 个 `Segment` 对象，每个 `Segment` 的数据结构由 `AtomicReferenceArray`（本质上是 `Object[]` 数组）和三个基于LRU算法的队列组成，`AtomicReferenceArray` 初始化为一个较小的容量（4），根据元素添加的情况会触发扩容，数据结构如下图所示：
+根据上述代码和注释信息，每个 `Segment` 的数据结构由 `AtomicReferenceArray`（本质上是 `Object[]` 数组）和三个基于LRU算法的队列组成，`AtomicReferenceArray` 初始化时为一个较小容量（4）的数组，在缓存的操作过程中会根据元素添加的情况触发扩容，在这里我们已经能看到 Guava Cache 数据结构的全貌了，如下所示：
 
+![]()
 
+在接下来的两个小节中，我们将深入讨论 `put` 和 `get` 方法的实现，分析这些数据结构是如何为这些操作提供支持的。
 
 ### put
 
-在深入 `put` 方法前，我们需要先了解下创建键值对元素的逻辑。在调用构造方法的逻辑时，其中 `entryFactory` 字段我们没具体讲解，在这里详细描述下，因为它与键值对的创建有关。`EntryFactory` 是一个枚举类，它其中定义了如 `STRONG_ACCESS_WRITE` 和 `WEAK_ACCESS_WRITE` 等一系列枚举，并根据创建缓存时指定的 `Key` 和 `Value` 引用类型来决定具体是哪个枚举，如其中的 `EntryFactory#getFactory` 方法所示：
+在深入 `put` 方法前，我们需要先了解下创建键值对元素的逻辑。在调用 `LocalCache` 的构造方法时，其中 `entryFactory` 字段我们没具体讲解，在这里详细描述下，因为它与键值对元素的创建有关。`EntryFactory` 是一个枚举类，它其中定义了如 `STRONG_ACCESS_WRITE` 和 `WEAK_ACCESS_WRITE` 等一系列枚举，并根据创建缓存时指定的 `Key` 和 `Value` 引用类型来决定具体是哪个枚举，如其中的 `EntryFactory#getFactory` 方法所示：
 
 ```java
 enum EntryFactory {
@@ -311,7 +354,7 @@ enum EntryFactory {
 }
 ```
 
-当不指定 `Key` 和 `Value` 的引用类型时（`Key` 和 `Value` 均为强引用），**默认为 `STRONG_ACCESS_WRITE` 枚举**，我们主要关注下它的逻辑：
+当不指定 `Key` 和 `Value` 的引用类型时（`Key` 和 `Value` 均为强引用），**默认为 `STRONG_ACCESS_WRITE` 枚举**，下面主要关注下它的逻辑：
 
 ```java
 enum EntryFactory {
@@ -327,7 +370,7 @@ enum EntryFactory {
 }
 ```
 
-其中 `newEntry` 为创建键值对元素的方法，创建的键值对类型为 `StrongAccessWriteEntry`，我们看下它的具体实现：
+其中 `EntryFactory#newEntry` 为创建键值对元素的方法，创建的键值对类型为 `StrongAccessWriteEntry`，我们看下它的具体实现：
 
 ```java
 class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
@@ -368,11 +411,11 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 
 `StrongAccessWriteEntry` 与它的父类 `StrongEntry` 均为定义在 `LocalCache` 内的静态内部类，构造方法需要指定 `Key, hash, next` 三个变量，这三个变量均定义在 `StrongEntry` 中，注意第三个变量 `ReferenceEntry<K, V> next`，它被父类中 `StrongEntry#next` 字段引用，并且该字段被 `final` 修饰，这与前文 JavaDoc 中所描述的内容相对应：
 
-> 键值对对象中的 `next` 字段被 `final` 修饰，所有的列表添加操作都只能在每个桶的前面进行，这也就使得检查变更比较容易，并且遍历速度也比较快。
+> 键值对对象中的 `next` 字段被 `final` 修饰，所有的添加操作都只能在每个桶的前面进行（头插法），这也就使得检查变更比较容易，并且遍历速度也比较快。
 
 所以实际上在添加新的键值对元素时，针对每个桶中元素操作采用的是“头插法”，这些元素是通过 `next` 指针引用的 **单向链表**。现在了解了元素的类型和创建逻辑，我们再来看下 `put` 方法的实现。
 
-Guava Cache 中是不允许添加 null 键和 null 值的，如果添加了 null 键或 null 值，会抛出 `NullPointerException` 异常：
+Guava Cache 是不允许添加 null 键和 null 值的，如果添加了 null 键或 null 值，会抛出 `NullPointerException` 异常，注意其中的注解 `@GuardedBy` 表示某方法或字段被调用或访问时需要持有哪个同步锁，在 Caffeine 中也有类似的应用：
 
 ```java
 class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
@@ -407,7 +450,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 }
 ```
 
-注意其中的注解 `@GuardedBy` 表示某方法或字段被调用或访问时需要持有哪个同步锁，在 Caffeine 中也有类似的应用。
+可以发现在执行 `put` 操作前，会根据键的哈希值来将其路由（`segmentFor`）到具体的 `Segment` 段，再调用 `Segment` 的 `put` 方法，而具体的 `put` 方法逻辑是在 `Segment` 中实现的。我们接着看 `Segment#put` 方法的实现（为了保证可读性，其中标注了数字的方法会在接下来小节中具体分析）：
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -455,19 +498,19 @@ static class Segment<K, V> extends ReentrantLock {
             preWriteCleanup(now);
 
             int newCount = this.count + 1;
-            // 2. 如果超过阈值，则扩容
+            // 如果超过阈值，则扩容
             if (newCount > this.threshold) {
-                // 扩容操作
+                // 2. 扩容操作
                 expand();
                 newCount = this.count + 1;
             }
 
-            // 根据元素的 hash 值找到对应的桶索引 index
+            // 根据元素的 hash 值找到对应的桶索引 index，并拿到头节点 first
             AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
             int index = hash & (table.length() - 1);
             ReferenceEntry<K, V> first = table.get(index);
 
-            // 尝试遍历链表寻找是否已经存在新添加的元素
+            // 尝试遍历链表寻找被新添加的元素是否已经存在
             for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
                 K entryKey = e.getKey();
                 // 如果新 put 的元素在缓存中已经存在
@@ -581,10 +624,13 @@ static class Segment<K, V> extends ReentrantLock {
         accessQueue.add(entry);
     }
 }
-
 ```
 
+上述源码中，我们能够发现 Guava Cache 是在 **Segment 的级别加锁** 的，通过这样的方式来减少竞争，其中 `preWriteCleanup` 方法负责处理元素的过期；`evictEntries` 方法负责驱逐保证缓存不超过最大的容量，根据 LRU 算法将最近最少访问的元素移除；`expand` 方法负责 `Segment` 的扩容；`setValue`, `recordWrite` 和 `recordLockedRead` 方法负责处理元素的更新并记录访问情况（更新 `accessQueue` 和 `writeQueue` 队列）。它对元素的管理相对简单也比较容易理解，接下来我们分步骤看下其中方法的实现。
+
 #### preWriteCleanup
+
+首先我们重点看下 `preWriteCleanup` 方法，该方法负责处理元素的过期，而元素过期的判断也非常简单，它会在每个元素中记录它们最新的访问或写入时间，将当前时间与这些时间作差后与配置的访问或写入过期时间作比较，如果超过了配置的时间则表示元素过期，并将它们进行驱逐。除此之外还有两个小细节需要留意，队列中维护元素的变动采用的是尾插法，也就是说元素越靠近尾部表示它越“新”，另一点是 `readCount` 会在写后标记为 0，这个变量的作用是保证在没发生写操作的情况下，而读次数超过一定阈值也会执行 `cleanUp` 的方法，这个在后文的 `get` 方法逻辑中还会提到。源码如下所示：
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -800,11 +846,12 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
         }
         return false;
     }
-
 }
 ```
 
 #### expand
+
+接下来是扩容方法，因为在初始化时，`Segment` 对象的 `table` 数组并没有被创建为最大的分段的大小，而是采取了较小的值 4 作为初始大小，所以随着元素的增加，会触发数组的扩容以满足元素的存储，它的负载因子默认为 0.75，每次扩容的大小为原有长度的 2 倍。其中对原有数组中元素的迁移蛮有意思，它会将能够哈希到同一个桶的元素直接赋值到新的数组，而不能被哈希到同一个桶的元素则创建它们的深拷贝，一个个放入新的数组中，如下：
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -895,6 +942,8 @@ static class Segment<K, V> extends ReentrantLock {
 
 #### evictEntries
 
+元素的驱逐方法 `evictEntries` 主要负责维护缓存不超过最大容量限制，实现原理也非常简单，它会根据 `accessQueue` 队列，将最近最少访问的元素优先移除：
+
 ```java
 static class Segment<K, V> extends ReentrantLock {
 
@@ -917,9 +966,7 @@ static class Segment<K, V> extends ReentrantLock {
         // 这个方法我们在前文中介绍过
         // 将元素的最近被访问队列 recencyQueue 清空，并使用尾插法将它们都放到访问队列 accessQueue 的尾节点
         drainRecencyQueue();
-
-        // If the newest entry by itself is too heavy for the segment, don't bother evicting
-        // anything else, just that
+        
         // 如果新加入的元素权重超过了最大权重，那么直接将该元素驱逐
         if (newest.getValueReference().getWeight() > maxSegmentWeight) {
             if (!removeEntry(newest, newest.getHash(), RemovalCause.SIZE)) {
@@ -952,7 +999,7 @@ static class Segment<K, V> extends ReentrantLock {
 
 #### postWriteCleanup
 
-
+写后清理操作需要关注的内容并不多，它主要处理监听器相关的逻辑，因为在我们的例子中并没有创建监听器所以就不在详细分析了。
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -992,6 +1039,8 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 
 ### get
 
+接下来我们要深入 `get` 方法的分析了，同样地它也会被路由（`segmentFor`）到具体的 `Segment`：
+
 ```java
 static class LocalManualCache<K, V> implements Cache<K, V>, Serializable {
     final LocalCache<K, V> localCache;
@@ -1023,9 +1072,13 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 }
 ```
 
+它的核心逻辑也在 `Segment` 中，注意读操作是不加锁的，它相比与 `put` 方法要简单，其中要注意的是 `recordRead` 方法，它会将被访问的元素添加到 `recencyQueue` 最近访问队列中。除此之外，因为元素的驱逐大多都是在 `put` 方法中完成的，为了在不发生写操作的情况下也能正常管理元素的生命中期，在 `get` 方法中也有相关的实现，比如 `postReadCleanup` 方法，它通过 `readCount` 的计数和 `DRAIN_THRESHOLD` 的阈值来判断是否需要驱逐元素，当计数超过阈值时则调用 `cleanUp` 方法进行驱逐，当然这并不会强制执行（因为它执行的是 `ReentrantLock#tryLock` 方法），尝试获取锁来执行，即使没有获取到锁，那么证明有写操作在执行，元素的驱逐操作也不需要再多关心了。源码如下所示：
+
 ```java
 static class Segment<K, V> extends ReentrantLock {
 
+    static final int DRAIN_THRESHOLD = 0x3F;
+    
     volatile int count;
 
     @Weak final LocalCache<K, V> map;
@@ -1033,6 +1086,8 @@ static class Segment<K, V> extends ReentrantLock {
     final Queue<ReferenceEntry<K, V>> recencyQueue;
 
     final StatsCounter statsCounter;
+
+    final AtomicInteger readCount = new AtomicInteger();
     
     @CanIgnoreReturnValue
     V get(K key, int hash, CacheLoader<? super K, V> loader) throws ExecutionException {
@@ -1156,10 +1211,26 @@ static class Segment<K, V> extends ReentrantLock {
             statsCounter.recordMisses(1);
         }
     }
+
+    // 通常在写入过程中进行清理。如果在足够数量的读取后没有观察到清理，请尝试从读取线程进行清理。
+    void postReadCleanup() {
+        // readCount 自增，如果达到阈值则执行清理操作，清理操作与写入操作中的逻辑一致
+        if ((readCount.incrementAndGet() & DRAIN_THRESHOLD) == 0) {
+            cleanUp();
+        }
+    }
+
+    void cleanUp() {
+        long now = map.ticker.read();
+        runLockedCleanup(now);
+        runUnlockedCleanup();
+    }
 }
 ```
 
 #### lockedGetOrLoad
+
+`lockedGetOrLoad` 是 `LoadingCache` 的核心逻辑，在某个 key 在缓存中不存在且配置了 loader 函数时会被执行，本质上这也是触发了一次写操作，将不存在的元素通过 loader 方法获取到具体值并加载到缓存中，所以在这里也会触发到元素生命周期管理的方法，如 `preWriteCleanup`，不过该方法总体上的实现与 `put` 方法类似，并没有特别复杂的地方。
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -1358,37 +1429,22 @@ static class Segment<K, V> extends ReentrantLock {
         }
     }
 }
-
-static class LoadingValueReference<K, V> implements ValueReference<K, V> {
-    volatile ValueReference<K, V> oldValue;
-    
-    public ListenableFuture<V> loadFuture(K key, CacheLoader<? super K, V> loader) {
-        try {
-            stopwatch.start();
-            V previousValue = oldValue.get();
-            if (previousValue == null) {
-                // 原值为空，执行配置的 loader 方法
-                V newValue = loader.load(key);
-                // 将新值设置到 loadingValueReference 中
-                return set(newValue) ? futureValue : immediateFuture(newValue);
-            }
-            ListenableFuture<V> newValue = loader.reload(key, previousValue);
-            if (newValue == null) {
-                return immediateFuture(null);
-            }
-
-            // 调用 Feature#transform 方法
-            return transform(newValue, newResult -> {
-                LoadingValueReference.this.set(newResult);
-                return newResult;
-            }, directExecutor());
-        } catch (Throwable t) {
-            ListenableFuture<V> result = setException(t) ? futureValue : fullyFailedFuture(t);
-            if (t instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            return result;
-        }
-    }
-}
 ```
+
+### 与 Caffeine 的对比
+
+Guava Cache 的源码要比 Caffeine 简单得多，但是 Caffeine 的实现更加优雅，可读性也更高（详细参阅[万文详解 Caffeine 实现原理]()）。
+
+Guava Cache 采用的是分段锁的思想，这种思想是在 JDK 1.8 之前的 `ConcurrentHashMap` 也有实现，但由于性能相对较差，在 JDK 1.8 及之后被弃用，取而代之的是使用 **CAS 操作**、少量 `synchronized` 关键字同步操作、及合适的 **自旋重试** 和 `volatile` 关键字的方案，而在 Caffeine 中，底层实现采用的便是 `ConcurrentHashMap`，它是在这之上添加了缓存相关的管理功能，如缓存过期、缓存淘汰等（相比于 Guava Cache 功能也更丰富），在这一点上 Caffeine 就已经占尽了优势，能够高效支持更大规模的并发访问，而且还能随着 JDK 升级过程中对 `ConcurrentHashMap` 的优化而持续享受优化后带来的并发效率的提升。
+
+在 Guava Cache 中针对缓存的驱逐采用了 **LRU 算法**，实际上这种驱逐策略并不精准，在 Caffeine 中提供了基于 **TinyLFU 算法** 的驱逐策略，这种算法在对缓存驱逐的准确性上更高，能更好的提供缓存命中率和保证缓存的性能。
+
+除此之外，Caffeine 提供了更复杂的缓存过期管理机制：**TimeWheel**，这一点在 Guava Cache 中是没有的（[本地缓存 Caffeine 中的时间轮（TimeWheel）是什么？]()）。另外，在对内存性能的优化上，Caffeine 针对常访问的字段避免了缓存伪共享问题（[高性能缓存设计：如何解决缓存伪共享问题]()），这些在 Guava Cache 中也是没有任何体现的。
+
+总而言之，Caffeine 是更加现代化的本地缓存，可以说它全面优于 Guava Cache，在技术选型上，可以优先考虑。不过，Guava Cache 也并不是一无是处，在对性能要求不高的场景下且不想引入额外的依赖（Caffeine），Guava Cache 也是一个不错的选择，因为 Guava 作为常用的 Java 库，通常都会在依赖中存在。
+
+---
+
+### 巨人的肩膀
+
+- [Github - Guava](https://github.com/google/guava)
