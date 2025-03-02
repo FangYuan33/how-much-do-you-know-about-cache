@@ -989,3 +989,406 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
     }
 }
 ```
+
+### get
+
+```java
+static class LocalManualCache<K, V> implements Cache<K, V>, Serializable {
+    final LocalCache<K, V> localCache;
+    
+    // ...
+}
+
+static class LocalLoadingCache<K, V> extends LocalManualCache<K, V>
+        implements LoadingCache<K, V> {
+
+    @Override
+    public V get(K key) throws ExecutionException {
+        return localCache.getOrLoad(key);
+    }
+}
+class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
+
+    @CheckForNull final CacheLoader<? super K, V> defaultLoader;
+    
+    V getOrLoad(K key) throws ExecutionException {
+        return get(key, defaultLoader);
+    }
+
+    @CanIgnoreReturnValue
+    V get(K key, CacheLoader<? super K, V> loader) throws ExecutionException {
+        int hash = hash(checkNotNull(key));
+        return segmentFor(hash).get(key, hash, loader);
+    }
+}
+```
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    volatile int count;
+
+    @Weak final LocalCache<K, V> map;
+
+    final Queue<ReferenceEntry<K, V>> recencyQueue;
+
+    final StatsCounter statsCounter;
+    
+    @CanIgnoreReturnValue
+    V get(K key, int hash, CacheLoader<? super K, V> loader) throws ExecutionException {
+        checkNotNull(key);
+        checkNotNull(loader);
+        try {
+            if (count != 0) {
+                ReferenceEntry<K, V> e = getEntry(key, hash);
+                // 获取到对应元素
+                if (e != null) {
+                    long now = map.ticker.read();
+                    // 获取到对应的 value
+                    V value = getLiveValue(e, now);
+                    // value 不为空
+                    if (value != null) {
+                        // 记录读操作，会将元素添加到最近访问队列 recencyQueue 的尾节点
+                        recordRead(e, now);
+                        // 命中计数 +1
+                        statsCounter.recordHits(1);
+                        // 如果配置了元素刷新则执行相关刷新逻辑
+                        return scheduleRefresh(e, key, hash, value, now, loader);
+                    }
+                    // value 为空
+                    ValueReference<K, V> valueReference = e.getValueReference();
+                    // 如果 value 正在 loading 则等待
+                    if (valueReference.isLoading()) {
+                        return waitForLoadingValue(e, key, valueReference);
+                    }
+                }
+            }
+
+            // 如果元素数量为 0，则执行该方法
+            return lockedGetOrLoad(key, hash, loader);
+        } catch (ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            if (cause instanceof Error) {
+                throw new ExecutionError((Error) cause);
+            } else if (cause instanceof RuntimeException) {
+                throw new UncheckedExecutionException(cause);
+            }
+            throw ee;
+        } finally {
+            postReadCleanup();
+        }
+    }
+    
+    @CheckForNull
+    ReferenceEntry<K, V> getEntry(Object key, int hash) {
+        // 获取到 table 数组中对应桶的头节点
+        for (ReferenceEntry<K, V> e = getFirst(hash); e != null; e = e.getNext()) {
+            // 元素 hash 值不相等继续遍历寻找
+            if (e.getHash() != hash) {
+                continue;
+            }
+
+            // 找到对应的元素后，如果 key 为空，则处理引用队列
+            K entryKey = e.getKey();
+            if (entryKey == null) {
+                tryDrainReferenceQueues();
+                continue;
+            }
+
+            // 如果 key 值相等，则返回该元素
+            if (map.keyEquivalence.equivalent(key, entryKey)) {
+                return e;
+            }
+        }
+
+        // 否则返回 null
+        return null;
+    }
+
+    V getLiveValue(ReferenceEntry<K, V> entry, long now) {
+        // key 和 value 为空的情况，处理引用队列
+        if (entry.getKey() == null) {
+            tryDrainReferenceQueues();
+            return null;
+        }
+        V value = entry.getValueReference().get();
+        if (value == null) {
+            tryDrainReferenceQueues();
+            return null;
+        }
+
+        // 如果元素过期了
+        if (map.isExpired(entry, now)) {
+            // 尝试加锁执行元素过期驱逐操作
+            tryExpireEntries(now);
+            return null;
+        }
+        return value;
+    }
+
+    void recordRead(ReferenceEntry<K, V> entry, long now) {
+        // 如果配置了访问后过期，则更新元素访问时间
+        if (map.recordsAccess()) {
+            entry.setAccessTime(now);
+        }
+        // 将元素添加到最近访问队列中
+        recencyQueue.add(entry);
+    }
+
+    V waitForLoadingValue(ReferenceEntry<K, V> e, K key, ValueReference<K, V> valueReference) throws ExecutionException {
+        if (!valueReference.isLoading()) {
+            throw new AssertionError();
+        }
+
+        checkState(!Thread.holdsLock(e), "Recursive load of: %s", key);
+        try {
+            // 等待元素加载完成
+            V value = valueReference.waitForValue();
+            if (value == null) {
+                throw new InvalidCacheLoadException("CacheLoader returned null for key " + key + ".");
+            }
+            // 执行记录读操作
+            long now = map.ticker.read();
+            recordRead(e, now);
+            return value;
+        } finally {
+            // 未命中统计数+1
+            statsCounter.recordMisses(1);
+        }
+    }
+}
+```
+
+#### lockedGetOrLoad
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    volatile int count;
+    
+    @Weak final LocalCache<K, V> map;
+
+    @CheckForNull volatile AtomicReferenceArray<ReferenceEntry<K, V>> table;
+
+    @GuardedBy("this")
+    final Queue<ReferenceEntry<K, V>> writeQueue;
+    @GuardedBy("this")
+    final Queue<ReferenceEntry<K, V>> accessQueue;
+
+    final StatsCounter statsCounter;
+
+    int modCount;
+    
+    // 加锁读或加载元素值
+    V lockedGetOrLoad(K key, int hash, CacheLoader<? super K, V> loader) throws ExecutionException {
+        ReferenceEntry<K, V> e;
+        ValueReference<K, V> valueReference = null;
+        LoadingValueReference<K, V> loadingValueReference = null;
+        boolean createNewEntry = true;
+
+        // 加锁
+        lock();
+        try {
+            long now = map.ticker.read();
+            // 写前整理操作，已经在上文中介绍过
+            preWriteCleanup(now);
+
+            int newCount = this.count - 1;
+            // 找到该元素对应桶的头节点
+            AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
+            int index = hash & (table.length() - 1);
+            ReferenceEntry<K, V> first = table.get(index);
+
+            // 遍历寻找该元素
+            for (e = first; e != null; e = e.getNext()) {
+                K entryKey = e.getKey();
+                // 如果找到了与该元素 key 值相等的元素
+                if (e.getHash() == hash && entryKey != null && map.keyEquivalence.equivalent(key, entryKey)) {
+                    valueReference = e.getValueReference();
+                    
+                    // 判断元素是否在加载中
+                    if (valueReference.isLoading()) {
+                        // 如果在加载中则不创建新的元素
+                        createNewEntry = false;
+                    } else {
+                        // 否则执行元素的加载
+                        V value = valueReference.get();
+                        if (value == null) {
+                            // 如果获取到的值为空，说明元素已经被回收了，则将该事件通知放到队列中
+                            enqueueNotification(entryKey, hash, value, valueReference.getWeight(), RemovalCause.COLLECTED);
+                        } else if (map.isExpired(e, now)) {
+                            // 如果元素过期了，则将该事件通知放到队列中
+                            enqueueNotification(entryKey, hash, value, valueReference.getWeight(), RemovalCause.EXPIRED);
+                        } else {
+                            // 否则，获取到了 value 值，执行记录读操作
+                            recordLockedRead(e, now);
+                            // 命中统计数+1
+                            statsCounter.recordHits(1);
+                            return value;
+                        }
+
+                        // value 无效的情况都需要将元素在写队列和访问队列中移除
+                        writeQueue.remove(e);
+                        accessQueue.remove(e);
+                        // 可见性写操作
+                        this.count = newCount;
+                    }
+                    break;
+                }
+            }
+
+            // 没有找到该元素，则需要创建新元素
+            if (createNewEntry) {
+                // value 的类型为 LoadingValueReference
+                loadingValueReference = new LoadingValueReference<>();
+
+                if (e == null) {
+                    e = newEntry(key, hash, first);
+                    e.setValueReference(loadingValueReference);
+                    table.set(index, e);
+                } else {
+                    e.setValueReference(loadingValueReference);
+                }
+            }
+        } finally {
+            // 解锁和写后通知操作
+            unlock();
+            postWriteCleanup();
+        }
+
+        if (createNewEntry) {
+            try {
+                // 同步执行元素的加载
+                synchronized (e) {
+                    return loadSync(key, hash, loadingValueReference, loader);
+                }
+            } finally {
+                // 元素未命中统计数+1
+                statsCounter.recordMisses(1);
+            }
+        } else {
+            // 元素已经存在，等在加载
+            return waitForLoadingValue(e, key, valueReference);
+        }
+    }
+
+    V loadSync(K key, int hash, LoadingValueReference<K, V> loadingValueReference, CacheLoader<? super K, V> loader) throws ExecutionException {
+        ListenableFuture<V> loadingFuture = loadingValueReference.loadFuture(key, loader);
+        return getAndRecordStats(key, hash, loadingValueReference, loadingFuture);
+    }
+
+    @CanIgnoreReturnValue
+    V getAndRecordStats(K key, int hash, LoadingValueReference<K, V> loadingValueReference, ListenableFuture<V> newValue) throws ExecutionException {
+        V value = null;
+        try {
+            // 阻塞执行 loader 函数（不允许中断）
+            value = getUninterruptibly(newValue);
+            if (value == null) {
+                throw new InvalidCacheLoadException("CacheLoader returned null for key " + key + ".");
+            }
+            // 标记元素加载完成
+            statsCounter.recordLoadSuccess(loadingValueReference.elapsedNanos());
+            // 保存加载的元素
+            storeLoadedValue(key, hash, loadingValueReference, value);
+            return value;
+        } finally {
+            if (value == null) {
+                statsCounter.recordLoadException(loadingValueReference.elapsedNanos());
+                removeLoadingValue(key, hash, loadingValueReference);
+            }
+        }
+    }
+    
+    // 逻辑与 put 方法类似
+    @CanIgnoreReturnValue
+    boolean storeLoadedValue(K key, int hash, LoadingValueReference<K, V> oldValueReference, V newValue) {
+        // 加锁
+        lock();
+        try {
+            long now = map.ticker.read();
+            preWriteCleanup(now);
+
+            int newCount = this.count + 1;
+            if (newCount > this.threshold) {
+                expand();
+                newCount = this.count + 1;
+            }
+
+            // 找到该元素对应的桶的头节点
+            AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
+            int index = hash & (table.length() - 1);
+            ReferenceEntry<K, V> first = table.get(index);
+
+            for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
+                K entryKey = e.getKey();
+                if (e.getHash() == hash && entryKey != null && map.keyEquivalence.equivalent(key, entryKey)) {
+                    ValueReference<K, V> valueReference = e.getValueReference();
+                    V entryValue = valueReference.get();
+ 
+                    // 如果元素已经存在，则替换旧的 LoadingValueReference
+                    if (oldValueReference == valueReference || (entryValue == null && valueReference != UNSET)) {
+                        ++modCount;
+                        if (oldValueReference.isActive()) {
+                            RemovalCause cause = (entryValue == null) ? RemovalCause.COLLECTED : RemovalCause.REPLACED;
+                            enqueueNotification(key, hash, entryValue, oldValueReference.getWeight(), cause);
+                            newCount--;
+                        }
+                        setValue(e, key, newValue, now);
+                        this.count = newCount;
+                        evictEntries(e);
+                        return true;
+                    }
+                    
+                    enqueueNotification(key, hash, newValue, 0, RemovalCause.REPLACED);
+                    return false;
+                }
+            }
+
+            ++modCount;
+            // 没有找到该 key 对应的元素则创建新的元素，此处逻辑与 put 元素的操作一致
+            ReferenceEntry<K, V> newEntry = newEntry(key, hash, first);
+            setValue(newEntry, key, newValue, now);
+            table.set(index, newEntry);
+            this.count = newCount;
+            evictEntries(newEntry);
+            return true;
+        } finally {
+            unlock();
+            postWriteCleanup();
+        }
+    }
+}
+
+static class LoadingValueReference<K, V> implements ValueReference<K, V> {
+    volatile ValueReference<K, V> oldValue;
+    
+    public ListenableFuture<V> loadFuture(K key, CacheLoader<? super K, V> loader) {
+        try {
+            stopwatch.start();
+            V previousValue = oldValue.get();
+            if (previousValue == null) {
+                // 原值为空，执行配置的 loader 方法
+                V newValue = loader.load(key);
+                // 将新值设置到 loadingValueReference 中
+                return set(newValue) ? futureValue : immediateFuture(newValue);
+            }
+            ListenableFuture<V> newValue = loader.reload(key, previousValue);
+            if (newValue == null) {
+                return immediateFuture(null);
+            }
+
+            // 调用 Feature#transform 方法
+            return transform(newValue, newResult -> {
+                LoadingValueReference.this.set(newResult);
+                return newResult;
+            }, directExecutor());
+        } catch (Throwable t) {
+            ListenableFuture<V> result = setException(t) ? futureValue : fullyFailedFuture(t);
+            if (t instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return result;
+        }
+    }
+}
+```
