@@ -421,10 +421,12 @@ static class Segment<K, V> extends ReentrantLock {
     final Queue<ReferenceEntry<K, V>> writeQueue;
 
     // guava cache 本身
-    @Weak final LocalCache<K, V> map;
+    @Weak
+    final LocalCache<K, V> map;
 
     // Segment 中保存元素的数组
-    @CheckForNull volatile AtomicReferenceArray<ReferenceEntry<K, V>> table;
+    @CheckForNull
+    volatile AtomicReferenceArray<ReferenceEntry<K, V>> table;
 
     // 计数器
     final StatsCounter statsCounter;
@@ -435,7 +437,10 @@ static class Segment<K, V> extends ReentrantLock {
     // 总的权重，不配置也表示元素数量，每个元素的权重为 1
     @GuardedBy("this")
     long totalWeight;
-    
+
+    // capacity * 0.75
+    int threshold;
+
     @CanIgnoreReturnValue
     @CheckForNull
     V put(K key, int hash, V value, boolean onlyIfAbsent) {
@@ -443,10 +448,13 @@ static class Segment<K, V> extends ReentrantLock {
         lock();
         try {
             long now = map.ticker.read();
+            // 1. 写前置的清理操作，包括处理过期元素等
             preWriteCleanup(now);
 
             int newCount = this.count + 1;
-            if (newCount > this.threshold) { // ensure capacity
+            // 2. 如果超过阈值，则扩容
+            if (newCount > this.threshold) {
+                // 扩容操作
                 expand();
                 newCount = this.count + 1;
             }
@@ -512,7 +520,39 @@ static class Segment<K, V> extends ReentrantLock {
             postWriteCleanup();
         }
     }
+}
 
+```
+
+#### preWriteCleanup
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    final AtomicInteger readCount = new AtomicInteger();
+
+    @GuardedBy("this")
+    final Queue<ReferenceEntry<K, V>> accessQueue;
+    final Queue<ReferenceEntry<K, V>> recencyQueue;
+    @GuardedBy("this")
+    final Queue<ReferenceEntry<K, V>> writeQueue;
+
+    // guava cache 本身
+    @Weak final LocalCache<K, V> map;
+
+    // Segment 中保存元素的数组
+    @CheckForNull volatile AtomicReferenceArray<ReferenceEntry<K, V>> table;
+
+    // 计数器
+    final StatsCounter statsCounter;
+
+    // 该段中的元素数量
+    volatile int count;
+
+    // 总的权重，不配置也表示元素数量，每个元素的权重为 1
+    @GuardedBy("this")
+    long totalWeight;
+    
     @GuardedBy("this")
     void preWriteCleanup(long now) {
         // 执行加锁的清理操作，包括处理引用队列和过期元素
@@ -699,6 +739,95 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
             return true;
         }
         return false;
+    }
+
+}
+```
+
+#### expand
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    static final int MAXIMUM_CAPACITY = 1 << 30;
+
+    // Segment 中保存元素的数组
+    @CheckForNull
+    volatile AtomicReferenceArray<ReferenceEntry<K, V>> table;
+
+    // 该段中的元素数量
+    volatile int count;
+
+    // 总的权重，不配置也表示元素数量，每个元素的权重为 1
+    @GuardedBy("this")
+    long totalWeight;
+
+    // capacity * 0.75
+    int threshold;
+
+    @GuardedBy("this")
+    void expand() {
+        AtomicReferenceArray<ReferenceEntry<K, V>> oldTable = table;
+        int oldCapacity = oldTable.length();
+        // 如果容量已经达到最大值，则直接返回
+        if (oldCapacity >= MAXIMUM_CAPACITY) {
+            return;
+        }
+
+        int newCount = count;
+        // 创建一个原来两倍容量的 AtomicReferenceArray
+        AtomicReferenceArray<ReferenceEntry<K, V>> newTable = newEntryArray(oldCapacity << 1);
+        // 阈值计算，负载因子为固定的 0.75
+        threshold = newTable.length() * 3 / 4;
+        // 掩码值为容量大小 -1，因为容量是 2 的幂次方，所以掩码值的二进制表示中，从最低位开始，所有位都是 1，位与运算能计算出元素对应的索引
+        int newMask = newTable.length() - 1;
+        // 遍历扩容前的 AtomicReferenceArray table
+        for (int oldIndex = 0; oldIndex < oldCapacity; ++oldIndex) {
+            ReferenceEntry<K, V> head = oldTable.get(oldIndex);
+
+            if (head != null) {
+                // 获取头节点的 next 节点
+                ReferenceEntry<K, V> next = head.getNext();
+                // 计算头节点在新数组中的索引
+                int headIndex = head.getHash() & newMask;
+
+                // 头节点的 next 节点为空，那么证明该桶位置只有一个元素，直接将头节点放在新数组的索引处 
+                if (next == null) {
+                    newTable.set(headIndex, head);
+                } else {
+                    // 遍历从 next 开始的节点，找到所有能 hash 到同一个桶的一批节点，然后将这些节点封装在新数组的对应索引处
+                    ReferenceEntry<K, V> tail = head;
+                    int tailIndex = headIndex;
+                    for (ReferenceEntry<K, V> e = next; e != null; e = e.getNext()) {
+                        int newIndex = e.getHash() & newMask;
+                        if (newIndex != tailIndex) {
+                            tailIndex = newIndex;
+                            tail = e;
+                        }
+                    }
+                    newTable.set(tailIndex, tail);
+
+                    // 将这些剩余的不能 hash 到同一个桶的节点，依次遍历，将它们放入新数组中
+                    for (ReferenceEntry<K, V> e = head; e != tail; e = e.getNext()) {
+                        int newIndex = e.getHash() & newMask;
+                        ReferenceEntry<K, V> newNext = newTable.get(newIndex);
+                        // 注意这里创建节点是深拷贝，并且采用的是头插法
+                        ReferenceEntry<K, V> newFirst = copyEntry(e, newNext);
+                        if (newFirst != null) {
+                            newTable.set(newIndex, newFirst);
+                        } else {
+                            // 如果 next 为空，表示发生了垃圾回收，将该被回收的元素的移除
+                            removeCollectedEntry(e);
+                            newCount--;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 操作完成后更新 table 和 count
+        table = newTable;
+        this.count = newCount;
     }
     
 }
