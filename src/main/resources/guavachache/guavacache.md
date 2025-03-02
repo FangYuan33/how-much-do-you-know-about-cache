@@ -441,6 +441,8 @@ static class Segment<K, V> extends ReentrantLock {
     // capacity * 0.75
     int threshold;
 
+    int modCount;
+    
     @CanIgnoreReturnValue
     @CheckForNull
     V put(K key, int hash, V value, boolean onlyIfAbsent) {
@@ -459,26 +461,23 @@ static class Segment<K, V> extends ReentrantLock {
                 newCount = this.count + 1;
             }
 
+            // 根据元素的 hash 值找到对应的桶索引 index
             AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
             int index = hash & (table.length() - 1);
             ReferenceEntry<K, V> first = table.get(index);
 
-            // Look for an existing entry.
+            // 尝试遍历链表寻找是否已经存在新添加的元素
             for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
                 K entryKey = e.getKey();
-                if (e.getHash() == hash
-                        && entryKey != null
-                        && map.keyEquivalence.equivalent(key, entryKey)) {
-                    // We found an existing entry.
-
+                // 如果新 put 的元素在缓存中已经存在
+                if (e.getHash() == hash && entryKey != null && map.keyEquivalence.equivalent(key, entryKey)) {
                     ValueReference<K, V> valueReference = e.getValueReference();
                     V entryValue = valueReference.get();
 
                     if (entryValue == null) {
                         ++modCount;
                         if (valueReference.isActive()) {
-                            enqueueNotification(
-                                    key, hash, entryValue, valueReference.getWeight(), RemovalCause.COLLECTED);
+                            enqueueNotification(key, hash, entryValue, valueReference.getWeight(), RemovalCause.COLLECTED);
                             setValue(e, key, value, now);
                             newCount = this.count; // count remains unchanged
                         } else {
@@ -486,6 +485,7 @@ static class Segment<K, V> extends ReentrantLock {
                             newCount = this.count + 1;
                         }
                         this.count = newCount; // write-volatile
+                        // 3. 驱逐元素
                         evictEntries(e);
                         return null;
                     } else if (onlyIfAbsent) {
@@ -500,19 +500,24 @@ static class Segment<K, V> extends ReentrantLock {
                         enqueueNotification(
                                 key, hash, entryValue, valueReference.getWeight(), RemovalCause.REPLACED);
                         setValue(e, key, value, now);
+                        // 3. 驱逐元素
                         evictEntries(e);
                         return entryValue;
                     }
                 }
             }
 
-            // Create a new entry.
+            // put 的元素是一个新元素
             ++modCount;
+            // 创建一个新元素，并指定 next 节点为 first 头节点
             ReferenceEntry<K, V> newEntry = newEntry(key, hash, first);
             setValue(newEntry, key, value, now);
+            // 将该元素封装到数组中
             table.set(index, newEntry);
+            // 更新 count 值
             newCount = this.count + 1;
-            this.count = newCount; // write-volatile
+            this.count = newCount;
+            // 3. 驱逐元素
             evictEntries(newEntry);
             return null;
         } finally {
@@ -830,5 +835,62 @@ static class Segment<K, V> extends ReentrantLock {
         this.count = newCount;
     }
     
+}
+```
+
+#### evictEntries
+
+```java
+static class Segment<K, V> extends ReentrantLock {
+
+    @Weak final LocalCache<K, V> map;
+
+    final long maxSegmentWeight;
+
+    @GuardedBy("this")
+    long totalWeight;
+
+    @GuardedBy("this")
+    final Queue<ReferenceEntry<K, V>> accessQueue;
+    
+    @GuardedBy("this")
+    void evictEntries(ReferenceEntry<K, V> newest) {
+        if (!map.evictsBySize()) {
+            return;
+        }
+
+        // 这个方法我们在前文中介绍过
+        // 将元素的最近被访问队列 recencyQueue 清空，并使用尾插法将它们都放到访问队列 accessQueue 的尾节点
+        drainRecencyQueue();
+
+        // If the newest entry by itself is too heavy for the segment, don't bother evicting
+        // anything else, just that
+        // 如果新加入的元素权重超过了最大权重，那么直接将该元素驱逐
+        if (newest.getValueReference().getWeight() > maxSegmentWeight) {
+            if (!removeEntry(newest, newest.getHash(), RemovalCause.SIZE)) {
+                throw new AssertionError();
+            }
+        }
+
+        // 如果当前权重超过最大权重，那么不断地驱逐元素直到满足条件
+        while (totalWeight > maxSegmentWeight) {
+            // 在 accessQueue 中从头节点遍历元素，依次移除最近没有被访问的元素
+            ReferenceEntry<K, V> e = getNextEvictable();
+            if (!removeEntry(e, e.getHash(), RemovalCause.SIZE)) {
+                throw new AssertionError();
+            }
+        }
+    }
+
+    @GuardedBy("this")
+    ReferenceEntry<K, V> getNextEvictable() {
+        for (ReferenceEntry<K, V> e : accessQueue) {
+            int weight = e.getValueReference().getWeight();
+            if (weight > 0) {
+                return e;
+            }
+        }
+        throw new AssertionError();
+    }
 }
 ```
