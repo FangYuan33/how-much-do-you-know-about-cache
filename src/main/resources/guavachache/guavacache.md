@@ -1,12 +1,12 @@
 本文将结合 **Guava Cache** 的源码来分析它的实现原理，并阐述它相比与 Caffeine Cache 在性能上的劣势。为了让大家对 Guava Cache 理解起来更容易，我们还是在开篇介绍它的原理：
 
-![]()
+![](guavacache.drawio.png)
 
-Guava Cache 通过分段（`Segment`）锁（`ReentrantLock`）机制、`volatile` 变量和多种缓存策略，实现了性能相对 Caffeine 性能较差的缓存，它的数据结构如上图所示。它会将缓存分成多个段（`Segment`）去管理，如果要创建大小为 1000 的缓存，那么实际上会分配 4 个段，每个段的最大容量为 250，读写操作在执行时都会经 `segmentFor` 方法路由到某一个段。具体的数据结构实现都在 `Segment` 中，它对元素的管理采用的是 `AtomicReferenceArray` 数组，在初始化时是较小的容量，并随着元素的增多触发扩容机制。我们称数组中每个索引的位置为“桶”，每个桶中保存了元素的引用，这些元素是通过单向链表维护的，每当有新元素添加时，采用的是“头插法”。此外，在 `Segment` 中还维护了三个基于 **LRU 算法** 的队列，处于尾部的元素最“新”，分别是 `accessQueue`、`writeQueue` 和 `recencyQueue`，它们分别用于记录被访问的元素、被写入的元素和“最近”被访问的元素。`accessQueue` 的主要作用是在对超过最大容量（超过访问后过期时间）的元素进行驱逐时，优先将最近被访问的越少的元素驱逐（头节点开始遍历）；`writeQueue` 的主要作用是对写后过期的元素进行驱逐时，优先将最近最少被访问的元素驱逐，因为越早被添加的元素越早过期，当发现某元素未过期时，后续队列中的元素是不需要判断的；`recencyQueue` 的作用是记录被访问过的元素，它们最终都会被移动到 `accessQueue` 中，并根据访问顺序添加到其尾节点中。
+Guava Cache 通过分段（`Segment`）锁（`ReentrantLock`）机制、`volatile` 变量和多种缓存策略实现了性能相对 Caffeine 性能较差的缓存，它的数据结构如上图所示。它会将缓存分成多个段（`Segment`）去管理，如果要创建大小为 1000 的缓存，那么实际上会分配 4 个段，每个段的最大容量为 250。读写操作在执行时都会经 `segmentFor` 方法“路由”到某一个段。数据结构的实现都在 `Segment` 中，它对元素的管理采用的是 `AtomicReferenceArray` 数组，在初始化时是较小的容量，并随着元素的增多触发扩容机制。我们称数组中每个索引的位置为“桶”，每个桶中保存了元素的引用，这些元素是通过单向链表维护的，每当有新元素添加时，采用的是“头插法”。此外，在 `Segment` 中还维护了三个基于 **LRU 算法** 的队列，处于尾部的元素最“新”，分别是 `accessQueue`、`writeQueue` 和 `recencyQueue`，它们分别用于记录被访问的元素、被写入的元素和“最近”被访问的元素。`accessQueue` 的主要作用是在对超过最大容量（超过访问后过期时间）的元素进行驱逐时，优先将最近被访问的越少的元素驱逐（头节点开始遍历）；`writeQueue` 的主要作用是对写后过期的元素进行驱逐时，优先将最近最少被访问的元素驱逐，因为越早被添加的元素越早过期，当发现某元素未过期时，后续队列中的元素是不需要判断的；`recencyQueue` 的作用是记录被访问过的元素，它们最终都会被移动到 `accessQueue` 中，并根据访问顺序添加到其尾节点中。
 
-对元素生命周期的管理主要是在 `put` 方法中完成的，`put` 相关的操作都需要加锁，如图中左上方所示，均为缓存元素的 `CleanUp` 相关的方法。Guava Cache 为了在不触发写操作而有大量读操作时也能正常触发对缓存元素的管理，添加了一个 `readCount` 变量，每次读请求都会使其累加，直到该变量超过规定阈值，也会触发缓存元素的驱逐（`postReadCleanUp`），保证数据的一致性，如图中右上方所示。
+对元素生命周期的管理主要是在 `put` 方法中完成的，`put` 相关的操作都需要加锁，如图中左上方所示，这些方法均与缓存元素的管理相关。Guava Cache 为了在不触发写操作而有大量读操作时也能正常触发对缓存元素的管理，添加了一个 `readCount` 变量，每次读请求都会使其累加，直到该变量超过规定阈值，也会触发缓存元素的驱逐（`postReadCleanUp`），保证数据的一致性，如图中右上方所示。
 
-以上便是对其实现原来的概括，接下来我们通过创建最大大小为 1000，并配置有访问后和写后过期时间的 `LoadingCache` 来分析 Guava Cache 的实现原理，主要关注它的构造方法，`put` 方法和 `get` 方法：
+接下来我们通过创建最大大小为 1000，并配置有访问后和写后过期时间的 `LoadingCache` 来分析 Guava Cache 的实现原理，主要关注它的构造方法，`put` 方法和 `get` 方法：
 
 ```java
 public class TestGuavaCache {
@@ -187,12 +187,12 @@ static class Segment<K, V> extends ReentrantLock {
 
 在该类中有一段 JavaDoc 值得读一下：
 
-**Segments** 内部维护了缓存本身（`final LocalCache<K, V> map`），所以它能一直保持数据一致性，也因此可以在不加锁的情况下进行读操作。键值对对象中的 `next` 字段被 `final` 修饰，所有的添加操作都只能在每个桶的前面进行（头插法），这也就使得检查变更比较容易，并且遍历速度也比较快。当节点需要更改时，会创建新节点来替换它们（深拷贝）。这对于哈希表来说效果很好，因为桶列表往往很短（平均长度小于二）。
+**Segments** 内部维护了缓存本身（`final LocalCache<K, V> map`），所以它能一直保持数据一致性，也因此可以在不加锁的情况下进行读操作。被缓存的键值对对象（构成单向链表）中的 `next` 字段被 `final` 修饰，所有的添加操作都只能在每个桶的前面进行（头插法），这也就使得检查变更比较容易，并且遍历速度也比较快。当节点需要更改时，会创建新节点来替换它们（深拷贝）。这对于哈希表来说效果很好，因为桶列表往往很短（平均长度小于二）。
 
 读操作可以在不加锁的情况下进行，但依赖于被 `volatile` 关键字修饰的变量，因为这个关键字能确保“可见性”。对大多数操作来说，可以将记录元素数量的字段 `count` 来作为确保可见性的变量。它带来了很多便利，在很多读操作中都需要参考这个字段：
 
 - 未加锁的读操作必须首先读取 `count` 字段，如果它是 0，则不应读任何元素
-- 加锁的写操作在任何桶发生结构性更改后都需要修改 `count` 字段值，这些写操作不能再任何情况下导致并发读操作发生读取数据不一致的情况，这样的保证使得 Map 中的读操作更容易。比如，没有操作可以揭示 Map 中添加了新的元素但是 `count` 字段没有被更新的情况，因此相对于读取没有原子性要求。
+- 加锁的写操作在任何桶发生结构性更改后都需要修改 `count` 字段值，这些写操作不能在任何情况下导致并发读操作发生读取数据不一致的情况，这样的保证使得 Map 中的读操作更容易。比如，没有操作可以揭示 Map 中添加了新的元素但是 `count` 字段没有被更新的情况，因此相对于读取没有原子性要求。
 
 作为提示，所有被 `volatile` 修饰的字段都很关键，它们的读取和写入都会用注释标记。
 
@@ -224,7 +224,7 @@ static class Segment<K, V> extends ReentrantLock {
      * comments.
      */
 
-通过它的 JavaDoc 我们可以暂时的了解到它通过写操作的数据一致性保证和被 `volatile` 修饰的字段来实现无锁的读操作，不过其中键值对中被 `final` 修饰的 `next` 字段究竟是怎么回事就需要在后文中去探究了。下面我们根据它的构造方法看一下该类中比较重要的字段信息：
+通过它的 JavaDoc 我们可以了解到它通过写操作对数据一致性的保证和被 `volatile` 修饰的字段来实现无锁的读操作，不过其中键值对中被 `final` 修饰的 `next` 字段究竟是怎么回事就需要在后文中去探究了。下面我们根据它的构造方法看一下该类中比较重要的字段信息：
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -303,13 +303,13 @@ static class Segment<K, V> extends ReentrantLock {
 
 根据上述代码和注释信息，每个 `Segment` 的数据结构由 `AtomicReferenceArray`（本质上是 `Object[]` 数组）和三个基于LRU算法的队列组成，`AtomicReferenceArray` 初始化时为一个较小容量（4）的数组，在缓存的操作过程中会根据元素添加的情况触发扩容，在这里我们已经能看到 Guava Cache 数据结构的全貌了，如下所示：
 
-![]()
+![](segment.png)
 
 在接下来的两个小节中，我们将深入讨论 `put` 和 `get` 方法的实现，分析这些数据结构是如何为这些操作提供支持的。
 
 ### put
 
-在深入 `put` 方法前，我们需要先了解下创建键值对元素的逻辑。在调用 `LocalCache` 的构造方法时，其中 `entryFactory` 字段我们没具体讲解，在这里详细描述下，因为它与键值对元素的创建有关。`EntryFactory` 是一个枚举类，它其中定义了如 `STRONG_ACCESS_WRITE` 和 `WEAK_ACCESS_WRITE` 等一系列枚举，并根据创建缓存时指定的 `Key` 和 `Value` 引用类型来决定具体是哪个枚举，如其中的 `EntryFactory#getFactory` 方法所示：
+在深入 `put` 方法前，我们需要先了解下创建键值对元素的逻辑。在调用 `LocalCache` 的构造方法时，其中 `entryFactory` 字段我们没具体讲解，在这里详细描述下，因为它与键值对元素的创建有关。`EntryFactory` 是一个枚举类，它其中定义了如 `STRONG_ACCESS_WRITE` 和 `WEAK_ACCESS_WRITE` 等一系列枚举，并根据创建缓存时指定的 `Key` 引用类型和元素管理策略来决定具体是哪个枚举，如其中的 `EntryFactory#getFactory` 方法所示：
 
 ```java
 enum EntryFactory {
@@ -354,7 +354,7 @@ enum EntryFactory {
 }
 ```
 
-当不指定 `Key` 和 `Value` 的引用类型时（`Key` 和 `Value` 均为强引用），**默认为 `STRONG_ACCESS_WRITE` 枚举**，下面主要关注下它的逻辑：
+当不指定 `Key` 的引用类型时为强引用，结合指定的访问后和写后过期策略，会匹配到 `STRONG_ACCESS_WRITE` 枚举，根据它的命名也能理解它表示 Key 为强引用且配置了访问后和写后过期策略。下面主要关注下它的逻辑：
 
 ```java
 enum EntryFactory {
@@ -415,7 +415,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 
 所以实际上在添加新的键值对元素时，针对每个桶中元素操作采用的是“头插法”，这些元素是通过 `next` 指针引用的 **单向链表**。现在了解了元素的类型和创建逻辑，我们再来看下 `put` 方法的实现。
 
-Guava Cache 是不允许添加 null 键和 null 值的，如果添加了 null 键或 null 值，会抛出 `NullPointerException` 异常，注意其中的注解 `@GuardedBy` 表示某方法或字段被调用或访问时需要持有哪个同步锁，在 Caffeine 中也有类似的应用：
+Guava Cache 是不允许添加 null 键和 null 值的，如果添加了 null 键或 null 值，会抛出 `NullPointerException` 异常。注意其中的注解 `@GuardedBy` 表示某方法或字段被调用或访问时需要持有哪个同步锁，在 Caffeine 中也有类似的应用：
 
 ```java
 class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> {
@@ -630,7 +630,7 @@ static class Segment<K, V> extends ReentrantLock {
 
 #### preWriteCleanup
 
-首先我们重点看下 `preWriteCleanup` 方法，该方法负责处理元素的过期，而元素过期的判断也非常简单，它会在每个元素中记录它们最新的访问或写入时间，将当前时间与这些时间作差后与配置的访问或写入过期时间作比较，如果超过了配置的时间则表示元素过期，并将它们进行驱逐。除此之外还有两个小细节需要留意，队列中维护元素的变动采用的是尾插法，也就是说元素越靠近尾部表示它越“新”，另一点是 `readCount` 会在写后标记为 0，这个变量的作用是保证在没发生写操作的情况下，而读次数超过一定阈值也会执行 `cleanUp` 的方法，这个在后文的 `get` 方法逻辑中还会提到。源码如下所示：
+首先我们重点看下 `preWriteCleanup` 方法，该方法负责处理元素的过期，而元素过期的判断也非常简单，它会在每个元素中记录它们最新的访问或写入时间，将当前时间与这些时间作差后与配置的访问或写入过期时间作比较，如果超过了配置的时间则表示元素过期，并将它们进行驱逐。除此之外还有两个小细节需要留意，队列中维护元素的变动采用的是 LRU 算法，并规定元素越靠近尾部表示它越“新”，另一点是 `readCount` 会在写后标记为 0，这个变量的作用是保证在没发生写操作的情况下，而读次数超过一定阈值也会执行 `cleanUp` 的方法，这个在后文的 `get` 方法逻辑中还会提到。源码如下所示：
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -1072,7 +1072,7 @@ class LocalCache<K, V> extends AbstractMap<K, V> implements ConcurrentMap<K, V> 
 }
 ```
 
-它的核心逻辑也在 `Segment` 中，注意读操作是不加锁的，它相比与 `put` 方法要简单，其中要注意的是 `recordRead` 方法，它会将被访问的元素添加到 `recencyQueue` 最近访问队列中。除此之外，因为元素的驱逐大多都是在 `put` 方法中完成的，为了在不发生写操作的情况下也能正常管理元素的生命中期，在 `get` 方法中也有相关的实现，比如 `postReadCleanup` 方法，它通过 `readCount` 的计数和 `DRAIN_THRESHOLD` 的阈值来判断是否需要驱逐元素，当计数超过阈值时则调用 `cleanUp` 方法进行驱逐，当然这并不会强制执行（因为它执行的是 `ReentrantLock#tryLock` 方法），尝试获取锁来执行，即使没有获取到锁，那么证明有写操作在执行，元素的驱逐操作也不需要再多关心了。源码如下所示：
+它的核心逻辑也在 `Segment` 中，注意读操作是不加锁的，它相比与 `put` 方法要简单，其中要注意的是 `recordRead` 方法，它会将被访问的元素添加到 `recencyQueue` 最近访问队列中，用于记录最近被访问元素的顺序，后续执行维护（cleanUp）相关的逻辑时，会将该队列中的元素全部移动到 `accessQueue` 队列中，用于根据元素的访问顺序来判断元素是否被驱逐。除此之外，因为元素的驱逐大多都是在 `put` 方法中完成的，为了在不发生写操作的情况下也能正常管理元素的生命中期，在 `get` 方法中也有相关的实现，比如 `postReadCleanup` 方法，它通过 `readCount` 的计数和 `DRAIN_THRESHOLD` 的阈值来判断是否需要驱逐元素，当计数超过阈值时则调用 `cleanUp` 方法进行驱逐，当然这并不会强制执行（因为它执行的是 `ReentrantLock#tryLock` 方法），尝试获取锁来执行，即使没有获取到锁，那么证明有写操作在执行，元素的驱逐操作也不需要再多关心了。源码如下所示：
 
 ```java
 static class Segment<K, V> extends ReentrantLock {
@@ -1435,7 +1435,7 @@ static class Segment<K, V> extends ReentrantLock {
 
 Guava Cache 的源码要比 Caffeine 简单得多，但是 Caffeine 的实现更加优雅，可读性也更高（详细参阅[万文详解 Caffeine 实现原理]()）。
 
-Guava Cache 采用的是分段锁的思想，这种思想是在 JDK 1.8 之前的 `ConcurrentHashMap` 也有实现，但由于性能相对较差，在 JDK 1.8 及之后被弃用，取而代之的是使用 **CAS 操作**、少量 `synchronized` 关键字同步操作、及合适的 **自旋重试** 和 `volatile` 关键字的方案，而在 Caffeine 中，底层实现采用的便是 `ConcurrentHashMap`，它是在这之上添加了缓存相关的管理功能，如缓存过期、缓存淘汰等（相比于 Guava Cache 功能也更丰富），在这一点上 Caffeine 就已经占尽了优势，能够高效支持更大规模的并发访问，而且还能随着 JDK 升级过程中对 `ConcurrentHashMap` 的优化而持续享受优化后带来的并发效率的提升。
+Guava Cache 采用的是分段锁的思想，这种思想在 JDK 1.7 的 `ConcurrentHashMap` 也有实现，但由于性能相对较差，在 JDK 1.8 及之后被弃用，取而代之的是使用 **CAS 操作**、少量 `synchronized` 关键字同步操作、及合适的 **自旋重试** 和 `volatile` 关键字的方案，而在 Caffeine 中，底层实现采用的便是 `ConcurrentHashMap`，它是在 `ConcurrentHashMap` 之上添加了缓存相关的管理功能，如缓存过期、缓存淘汰等（相比于 Guava Cache 功能也更丰富），在这一点上 Caffeine 就已经占尽了优势，能够高效支持更大规模的并发访问，而且还能随着 JDK 升级过程中对 `ConcurrentHashMap` 的优化而持续享受优化后带来的并发效率的提升。
 
 在 Guava Cache 中针对缓存的驱逐采用了 **LRU 算法**，实际上这种驱逐策略并不精准，在 Caffeine 中提供了基于 **TinyLFU 算法** 的驱逐策略，这种算法在对缓存驱逐的准确性上更高，能更好的提供缓存命中率和保证缓存的性能。
 
