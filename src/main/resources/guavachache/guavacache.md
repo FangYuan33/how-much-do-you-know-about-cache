@@ -1,4 +1,4 @@
-本文将结合 **Guava Cache** 的源码来分析它的实现原理，并阐述它相比与 Caffeine Cache 在性能上的劣势。为了让大家对 Guava Cache 理解起来更容易，我们还是在开篇介绍它的原理：
+本文将结合 **Guava Cache** 的源码来分析它的实现原理，并阐述它相比于 Caffeine Cache 在性能上的劣势。为了让大家对 Guava Cache 理解起来更容易，我们还是在开篇介绍它的原理：
 
 ![](guavacache.drawio.png)
 
@@ -196,7 +196,6 @@ static class Segment<K, V> extends ReentrantLock {
 
 作为提示，所有被 `volatile` 修饰的字段都很关键，它们的读取和写入都会用注释标记。
 
->     /*
      * Segments maintain a table of entry lists that are ALWAYS kept in a consistent state, so can
      * be read without locking. Next fields of nodes are immutable (final). All list additions are
      * performed at the front of each bin. This makes it easy to check changes, and also fast to
@@ -222,7 +221,6 @@ static class Segment<K, V> extends ReentrantLock {
      *
      * As a guide, all critical volatile reads and writes to the count field are marked in code
      * comments.
-     */
 
 通过它的 JavaDoc 我们可以了解到它通过写操作对数据一致性的保证和被 `volatile` 修饰的字段来实现无锁的读操作，不过其中键值对中被 `final` 修饰的 `next` 字段究竟是怎么回事就需要在后文中去探究了。下面我们根据它的构造方法看一下该类中比较重要的字段信息：
 
